@@ -1,0 +1,43 @@
+{
+  "name": "dsh-context-optimizer",
+  "version": "0.1.0",
+  "description": "Context-window optimization and session-continuity plugin for DeepSeek Harness: confined code execution, batched command runs with searchable indexing, and prompt-time session snapshot injection.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "context-window",
+    "tool-execution",
+    "session-continuity"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/unit/*.test.mjs test/host/*.test.mjs",
+    "test:unit": "npm run build && node --test test/unit/*.test.mjs",
+    "test:host": "npm run build && CTX_REQUIRE_HOST=1 node --test test/host/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.5.0",
+    "yaml": "^2.9.0"
+  }
+}

@@ -1,0 +1,42 @@
+# Bundle patch layer for `dsh-context-optimizer`.
+#
+# Composed into a profile tree by `dsh.profile.bundles`, then by the profile's
+# own cordis.patch.yml, then by $DSH_HOME/cordis.patch.yml, then by --patch.
+#
+# Do NOT hand-copy this row into a profile's cordis.patch.yml to "install" it:
+# a patch row keyed by id REPLACES the whole config value (there is no deep
+# merge), and a duplicate loader row id throws at boot. Install with
+# `dsh plugin --profile web add link:<abs-pkg-dir>` instead, which writes the
+# dependency row, reconciles dsh.profile.bundles, and creates the symlink.
+#
+# Omitting `config` entirely is safe: `apply(ctx, config)` then receives no
+# block and the plugin falls back to its defaults. Uncomment the block below to
+# tune it, and restate EVERY key you want to keep when overriding from a profile
+# patch, because the override replaces this whole value.
+- insert:
+    - id: context-optimizer
+      name: dsh-context-optimizer
+      # config:
+      #   stateDir: '/home/administrator/agent-workspace/.dsh/dsh-context-optimizer'
+      #   toolPrefix: 'ctx_'
+      #   executor:
+      #     defaultTimeoutMs: 30000
+      #     maxStdoutBytes: 8192
+      #     maxStderrBytes: 4096
+      #     sandboxMode: workspace-write
+      #     allowUnconfined: false
+      #     envAllowlist: [PATH, LANG, LC_ALL, TZ, NODE_OPTIONS, PYTHONPATH]
+      #     scratchDir: /tmp
+      #   search:
+      #     defaultLimit: 5
+      #     maxLimit: 50
+      #     snippetChars: 240
+      #   routing:
+      #     advisory: true
+      #     advisoryThrottle: 10
+      #     denyPatterns: []
+      #   session:
+      #     recordEvents: true
+      #     maxEventsPerSession: 5000
+      #     maxSnapshotChars: 2048
+      #     injectSnapshot: true

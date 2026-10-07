@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.npm-cache/
+.tmp-ctxopt-*
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

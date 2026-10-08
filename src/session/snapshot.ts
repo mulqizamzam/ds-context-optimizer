@@ -175,6 +175,20 @@ export function escapeXml(value: string): string {
 const EMPTY_SNAPSHOT = '<session_snapshot></session_snapshot>'
 
 /**
+ * Sections that come from the evidence layer rather than from the event log.
+ *
+ * They are optional and additive: a caller that supplies none gets byte-for-byte
+ * the document the previous version built, which is why the snapshot can grow
+ * more useful without any existing test having to move.
+ */
+export interface SnapshotExtras {
+  /** Evidence worth carrying forward, each already short. */
+  readonly importantEvidence?: readonly string[]
+  /** Contradictions the retrieval layer found, each already one line. */
+  readonly contradictions?: readonly string[]
+}
+
+/**
  * Build the resume snapshot handed to the model at the start of a later turn.
  *
  * The original filtered `priority <= 2` before selecting, which excluded every
@@ -189,7 +203,11 @@ const EMPTY_SNAPSHOT = '<session_snapshot></session_snapshot>'
  * all when even that exceeds the budget. The section arithmetic below was
  * verified exact for budgets above the wrapper, so no path can overrun.
  */
-export function buildSnapshot(events: SessionEvent[], maxChars = 2_048): string {
+export function buildSnapshot(
+  events: SessionEvent[],
+  maxChars = 2_048,
+  extras?: SnapshotExtras,
+): string {
   if (!Number.isFinite(maxChars) || maxChars < EMPTY_SNAPSHOT.length) return ''
   const ordered = [...events].sort((a, b) => a.timestamp - b.timestamp)
   const lines: string[] = ['<session_snapshot>']
@@ -197,6 +215,31 @@ export function buildSnapshot(events: SessionEvent[], maxChars = 2_048): string 
 
   let budget = maxChars - used - '\n</session_snapshot>'.length
   if (budget < 0) return EMPTY_SNAPSHOT
+
+  /**
+   * Append one section if it fits, shrinking it to a single item if that is
+   * what the remaining budget allows.
+   *
+   * Extras and event sections go through the same helper because they must obey
+   * the same ceiling: an evidence section that overran the budget would be the
+   * one leak this whole plugin exists to prevent.
+   */
+  const pushSection = (tag: string, picked: string[]): void => {
+    if (picked.length === 0) return
+    const body = picked.map((item) => `  <item>${escapeXml(item)}</item>`).join('\n')
+    const block = `  <${tag}>\n${body}\n  </${tag}>`
+    if (block.length + 1 > budget) {
+      // Keep the section only if at least one item fits; the next, smaller
+      // section may still fit in what is left.
+      const oneItem = `  <${tag}>\n  <item>${escapeXml(picked.at(-1)!)}</item>\n  </${tag}>`
+      if (oneItem.length + 1 > budget) return
+      lines.push(oneItem)
+      budget -= oneItem.length + 1
+      return
+    }
+    lines.push(block)
+    budget -= block.length + 1
+  }
 
   for (const [tag, category] of SECTIONS) {
     const items = ordered.filter((event) => event.category === category)
@@ -208,20 +251,19 @@ export function buildSnapshot(events: SessionEvent[], maxChars = 2_048): string 
     }
     if (picked.length === 0) continue
     picked.reverse()
+    pushSection(tag, picked)
+  }
 
-    const body = picked.map((item) => `  <item>${escapeXml(item)}</item>`).join('\n')
-    const block = `  <${tag}>\n${body}\n  </${tag}>`
-    if (block.length + 1 > budget) {
-      // Keep the section only if at least one item fits; the next, smaller
-      // section may still fit in what is left.
-      const oneItem = `  <${tag}>\n  <item>${escapeXml(picked.at(-1)!)}</item>\n  </${tag}>`
-      if (oneItem.length + 1 > budget) break
-      lines.push(oneItem)
-      budget -= oneItem.length + 1
-      continue
-    }
-    lines.push(block)
-    budget -= block.length + 1
+  for (const [tag, values] of [
+    ['important_evidence', extras?.importantEvidence ?? []],
+    ['contradictions', extras?.contradictions ?? []],
+  ] as const) {
+    const picked = values
+      .map((value) => (typeof value === 'string' ? value.trim() : ''))
+      .filter((value) => value !== '')
+      .slice(-5)
+      .map((value) => value.slice(0, 400))
+    pushSection(tag, picked)
   }
 
   lines.push('</session_snapshot>')

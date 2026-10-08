@@ -76,6 +76,15 @@ export interface SessionEvent {
   /** Unix epoch ms, taken from the host event's `time`. */
   readonly timestamp: number
   readonly cwd: string
+  /**
+   * Stable identity of the stored row. Derived by the store when the caller
+   * does not supply one, so a reference handed to the model survives a restart.
+   */
+  readonly eventId?: string
+  /** Epoch ms of the first time this row was stored. */
+  readonly firstSeenAt?: number
+  /** Epoch ms of the last time this row was written. */
+  readonly lastSeenAt?: number
 }
 
 /** One indexed chunk plus the source it came from. */
@@ -85,10 +94,73 @@ export interface IndexedChunk {
   readonly text: string
 }
 
-/** One ranked search hit. */
+/**
+ * One ranked search hit.
+ *
+ * The provenance fields were added alongside the original four, never in place
+ * of them: a caller that only reads `source`, `ordinal`, `score`, and `snippet`
+ * keeps working, and a caller that wants to answer "where did this come from"
+ * now can. Every added field is small and fixed-size, so widening a hit does not
+ * widen the payload a model sees — the snippet remains the only unbounded field
+ * and it is clipped by the store.
+ */
 export interface SearchHit {
   readonly source: string
   readonly ordinal: number
   readonly score: number
   readonly snippet: string
+  /** Stable identity of the source this chunk belongs to. */
+  readonly sourceId: string
+  /** Stable identity of this chunk within the source. */
+  readonly chunkId: string
+  /** Stable evidence identity, usable with `ctx_expand`. */
+  readonly evidenceId: string
+  /** SHA-256 of the chunk text as stored. */
+  readonly contentHash: string
+  /** Present only when the source was indexed with real line metadata. */
+  readonly lineStart?: number
+  readonly lineEnd?: number
+  /** Epoch ms of the last write that produced this chunk. */
+  readonly updatedAt: number
+  /** Epoch ms of the first write that produced this chunk. */
+  readonly firstSeenAt: number
+  /** `'file'`, `'directory'`, `'url'`, `'command'`, `'session'`, or `'index'`. */
+  readonly sourceType: string
+  readonly pathOrUrl?: string
+  /**
+   * True when the stored hash no longer matches the text the index holds.
+   * Always false for a fresh search: the hash is written in the same
+   * transaction as the text, so this only fires on out-of-band damage.
+   */
+  readonly stale: boolean
 }
+
+/**
+ * One chunk plus everything known about where it came from.
+ *
+ * `text` is the whole chunk, which is why this type never appears in a search
+ * result: it is the payload `ctx_expand` hands over after a bounded request.
+ */
+export interface EvidenceRecord {
+  readonly evidenceId: string
+  readonly sourceId: string
+  readonly chunkId: string
+  readonly source: string
+  readonly ordinal: number
+  readonly sourceType: string
+  readonly pathOrUrl?: string
+  readonly lineStart?: number
+  readonly lineEnd?: number
+  readonly command?: string
+  readonly sessionId?: string
+  readonly contentHash: string
+  readonly charLen: number
+  readonly text: string
+  readonly indexedAt: number
+  readonly updatedAt: number
+  readonly firstSeenAt: number
+  readonly stale: boolean
+}
+
+/** Lifecycle class a stored record is garbage-collected under. */
+export type RetentionClass = 'ephemeral' | 'session' | 'project' | 'persistent'

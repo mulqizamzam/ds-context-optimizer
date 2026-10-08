@@ -30,6 +30,62 @@ export interface SessionConfig {
   readonly injectSnapshot: boolean
 }
 
+/**
+ * How the character budget of one generated payload is split.
+ *
+ * The weights are relative, not absolute: `budget.ts` normalises them, so an
+ * operator who only cares that evidence outweighs everything else can write
+ * `evidence: 7` and leave the rest alone.
+ */
+export interface BudgetWeights {
+  /** Recently seen evidence. */
+  readonly recent: number
+  /** The task the session is serving. */
+  readonly task: number
+  /** Retrieved evidence. */
+  readonly evidence: number
+  /** Provenance and structural metadata. */
+  readonly metadata: number
+}
+
+export interface ContextBudgetConfig {
+  readonly enabled: boolean
+  /** Total character ceiling for one payload, before the reserve. */
+  readonly totalChars: number
+  /** Characters held back from allocation, so a payload never fills the window. */
+  readonly reserveChars: number
+  readonly weights: BudgetWeights
+}
+
+export interface CacheConfig {
+  readonly enabled: boolean
+  readonly ttlMs: number
+  readonly maxEntries: number
+}
+
+/**
+ * Age after which each retention class stops being protected.
+ *
+ * Zero means "never reclaim by age" and is a documented value, not an off
+ * switch: an operator who wants an unbounded store writes 0 for that class, and
+ * an operator who wants everything ephemeral to go quickly writes a small
+ * number. There is no fourth state that silently does something else.
+ */
+export interface RetentionConfig {
+  /** One-shot command output. */
+  readonly ephemeralMs: number
+  /** Rows belonging to one session's log. */
+  readonly sessionMs: number
+  /** Indexed project content. */
+  readonly projectMs: number
+}
+
+/** Bounds on relationship traversal, enforced by the graph module as well. */
+export interface RelationsConfig {
+  readonly maxDepth: number
+  readonly maxNodes: number
+}
+
 export interface ContextOptimizerConfig {
   /** Directory holding the index and session databases. */
   readonly stateDir: string
@@ -39,6 +95,10 @@ export interface ContextOptimizerConfig {
   readonly search: SearchConfig
   readonly routing: RoutingSettings
   readonly session: SessionConfig
+  readonly contextBudget: ContextBudgetConfig
+  readonly cache: CacheConfig
+  readonly retention: RetentionConfig
+  readonly relations: RelationsConfig
 }
 
 export const DEFAULT_CONFIG: ContextOptimizerConfig = {
@@ -56,6 +116,19 @@ export const DEFAULT_CONFIG: ContextOptimizerConfig = {
   search: { defaultLimit: 5, maxLimit: 50, snippetChars: 240 },
   routing: { advisory: true, advisoryThrottle: 10, denyPatterns: [] },
   session: { recordEvents: true, maxEventsPerSession: 5_000, maxSnapshotChars: 2_048, injectSnapshot: true },
+  contextBudget: {
+    enabled: true,
+    totalChars: 12_000,
+    reserveChars: 2_000,
+    weights: { recent: 0.2, task: 0.3, evidence: 0.35, metadata: 0.15 },
+  },
+  cache: { enabled: true, ttlMs: 300_000, maxEntries: 1_000 },
+  retention: {
+    ephemeralMs: 24 * 60 * 60 * 1000,
+    sessionMs: 7 * 24 * 60 * 60 * 1000,
+    projectMs: 30 * 24 * 60 * 60 * 1000,
+  },
+  relations: { maxDepth: 2, maxNodes: 50 },
 }
 
 export class ConfigError extends Error {
@@ -81,6 +154,11 @@ export function resolveConfig(raw: unknown): ContextOptimizerConfig {
   const searchInput = mapping(input.search, 'search')
   const routingInput = mapping(input.routing, 'routing')
   const sessionInput = mapping(input.session, 'session')
+  const budgetInput = mapping(input.contextBudget, 'contextBudget')
+  const cacheInput = mapping(input.cache, 'cache')
+  const retentionInput = mapping(input.retention, 'retention')
+  const relationsInput = mapping(input.relations, 'relations')
+  const weightsInput = mapping(budgetInput.weights, 'contextBudget.weights')
 
   const stateDir = optionalString(input.stateDir, 'stateDir') ?? DEFAULT_CONFIG.stateDir
   const toolPrefix = optionalString(input.toolPrefix, 'toolPrefix') ?? DEFAULT_CONFIG.toolPrefix
@@ -94,6 +172,18 @@ export function resolveConfig(raw: unknown): ContextOptimizerConfig {
       `executor.sandboxMode must be "read-only" or "workspace-write"; got ${JSON.stringify(sandboxMode)}`,
     )
   }
+
+  const budgetEnabled = optionalBool(budgetInput.enabled, 'contextBudget.enabled') ?? DEFAULT_CONFIG.contextBudget.enabled
+  const totalChars = positiveInt(budgetInput.totalChars, 'contextBudget.totalChars', DEFAULT_CONFIG.contextBudget.totalChars)
+  const reserveChars = nonNegativeInt(budgetInput.reserveChars, 'contextBudget.reserveChars', DEFAULT_CONFIG.contextBudget.reserveChars)
+  if (reserveChars >= totalChars) {
+    throw new ConfigError(
+      `contextBudget.reserveChars (${reserveChars}) must be smaller than contextBudget.totalChars (${totalChars}); `
+        + 'a reserve that swallows the whole budget leaves nothing to allocate',
+    )
+  }
+
+  const ttlMs = positiveInt(cacheInput.ttlMs, 'cache.ttlMs', DEFAULT_CONFIG.cache.ttlMs)
 
   return {
     stateDir: path.resolve(stateDir),
@@ -122,6 +212,26 @@ export function resolveConfig(raw: unknown): ContextOptimizerConfig {
       maxEventsPerSession: nonNegativeInt(sessionInput.maxEventsPerSession, 'session.maxEventsPerSession', DEFAULT_CONFIG.session.maxEventsPerSession),
       maxSnapshotChars: positiveInt(sessionInput.maxSnapshotChars, 'session.maxSnapshotChars', DEFAULT_CONFIG.session.maxSnapshotChars),
       injectSnapshot: optionalBool(sessionInput.injectSnapshot, 'session.injectSnapshot') ?? DEFAULT_CONFIG.session.injectSnapshot,
+    },
+    contextBudget: {
+      enabled: budgetEnabled,
+      totalChars,
+      reserveChars,
+      weights: weights(weightsInput, DEFAULT_CONFIG.contextBudget.weights),
+    },
+    cache: {
+      enabled: optionalBool(cacheInput.enabled, 'cache.enabled') ?? DEFAULT_CONFIG.cache.enabled,
+      ttlMs,
+      maxEntries: positiveInt(cacheInput.maxEntries, 'cache.maxEntries', DEFAULT_CONFIG.cache.maxEntries),
+    },
+    retention: {
+      ephemeralMs: nonNegativeInt(retentionInput.ephemeralMs, 'retention.ephemeralMs', DEFAULT_CONFIG.retention.ephemeralMs),
+      sessionMs: nonNegativeInt(retentionInput.sessionMs, 'retention.sessionMs', DEFAULT_CONFIG.retention.sessionMs),
+      projectMs: nonNegativeInt(retentionInput.projectMs, 'retention.projectMs', DEFAULT_CONFIG.retention.projectMs),
+    },
+    relations: {
+      maxDepth: boundedInt(relationsInput.maxDepth, 'relations.maxDepth', DEFAULT_CONFIG.relations.maxDepth, 1, 5),
+      maxNodes: boundedInt(relationsInput.maxNodes, 'relations.maxNodes', DEFAULT_CONFIG.relations.maxNodes, 1, 500),
     },
   }
 }
@@ -185,6 +295,34 @@ function denyPatterns(value: unknown): string[] {
   return patterns
 }
 
+/**
+ * Weights are relative shares, so only the range is validated.
+ *
+ * A sum other than 1 is accepted on purpose: `budget.ts` normalises, and an
+ * operator who writes `evidence: 7` meant a ratio, not a mistake. A negative or
+ * non-finite weight is refused because the normaliser would have to invent a
+ * meaning for it, and a value above 1 is refused with a message that says the
+ * scale is relative, so the error teaches the shape instead of just failing.
+ */
+function weights(value: Record<string, unknown>, fallback: BudgetWeights): BudgetWeights {
+  const keys = ['recent', 'task', 'evidence', 'metadata'] as const
+  const result = {} as Record<(typeof keys)[number], number>
+  for (const key of keys) {
+    const raw = value[key]
+    if (raw === undefined) {
+      result[key] = fallback[key]
+      continue
+    }
+    if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0 || raw > 1) {
+      throw new ConfigError(
+        `contextBudget.weights.${key} must be a number between 0 and 1 (the weights are relative shares, not percentages); got ${JSON.stringify(raw)}`,
+      )
+    }
+    result[key] = raw
+  }
+  return result as BudgetWeights
+}
+
 function positiveInt(value: unknown, field: string, fallback: number): number {
   if (value === undefined) return fallback
   if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
@@ -197,6 +335,15 @@ function nonNegativeInt(value: unknown, field: string, fallback: number): number
   if (value === undefined) return fallback
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
     throw new ConfigError(`${field} must be a non-negative integer`)
+  }
+  return value
+}
+
+/** An integer inside an inclusive range, used for the traversal bounds. */
+function boundedInt(value: unknown, field: string, fallback: number, min: number, max: number): number {
+  if (value === undefined) return fallback
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    throw new ConfigError(`${field} must be an integer between ${min} and ${max}`)
   }
   return value
 }

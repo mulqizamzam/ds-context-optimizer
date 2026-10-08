@@ -46,14 +46,27 @@ const harness = skip
       LocalSandboxProvider: (await import(SANDBOX_ENTRY)).default,
     }
 
+/**
+ * The full model-facing surface, in registration order.
+ *
+ * The first ten are the tools the plugin registered before the context
+ * infrastructure existed; the last four were added when retrieval became
+ * something a model can expand, collect, diff, and traverse rather than only
+ * query. The list is exact on purpose: it is the assertion that a new tool
+ * cannot appear without a test that calls it through the real pipeline.
+ */
 const EXPECTED_TOOLS = [
   'ctx_batch_execute',
+  'ctx_diff',
   'ctx_doctor',
   'ctx_execute',
   'ctx_execute_file',
+  'ctx_expand',
   'ctx_fetch_and_index',
+  'ctx_gc',
   'ctx_index',
   'ctx_purge',
+  'ctx_related',
   'ctx_resume',
   'ctx_search',
   'ctx_stats',
@@ -1485,6 +1498,444 @@ test('a fetch against a silent server is bounded by a deadline', { skip }, async
     assert.match(result.value.error, /budget|abort|timeout/i, JSON.stringify(result.value))
   } finally {
     await server.close()
+    host.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// The context-infrastructure tools. Each one is driven through the same real
+// pipeline as everything above, because the failure mode each one guards
+// against — an unbounded payload, an identifier that becomes a path, a plan
+// that deletes what it never named — is only visible once the host has
+// serialised the answer, so the assertions read the rendered text and the real
+// body, never an object shape.
+// ---------------------------------------------------------------------------
+
+test('ctx_expand returns the real chunk with provenance, inside the expansion ceiling', { skip }, async () => {
+  const host = await boot()
+  const work = workFixture('expand')
+  try {
+    fs.mkdirSync(path.join(work.root, 'docs'), { recursive: true })
+    fs.writeFileSync(path.join(work.root, 'docs', 'notes.md'), 'expandonlytoken first line of the note\nsecond line of the note\n')
+
+    const indexed = await host.call('ctx_index', { path: path.join(work.relative), source: 'expand-src' })
+    assert.equal(indexed.value.ok, true, JSON.stringify(indexed.value))
+    assert.equal(indexed.value.chunks, 1, JSON.stringify(indexed.value))
+
+    const found = await host.call('ctx_search', { queries: ['expandonlytoken'], limit: 5 })
+    assert.equal(found.value.results[0].matches.length, 1, JSON.stringify(found.value.results))
+    const evidenceId = found.value.results[0].matches[0].evidenceId
+    assert.match(evidenceId, /^ev_[0-9a-f]{16}$/)
+
+    const expanded = await host.call('ctx_expand', { evidenceId })
+    assert.equal(expanded.isError, false, JSON.stringify(expanded.content))
+    assert.equal(expanded.value.ok, true, JSON.stringify(expanded.value))
+    assert.equal(expanded.value.evidenceId, evidenceId)
+    assert.ok(expanded.value.text.length <= 4096, `the expansion is ${expanded.value.text.length} characters`)
+    // The body the model asked for, not a description of it.
+    assert.match(expanded.value.text, /expandonlytoken first line of the note/)
+    assert.match(expanded.content[0].text, /expandonlytoken first line of the note/)
+
+    // Provenance: what the model needs to trust or re-verify the chunk.
+    assert.equal(typeof expanded.value.provenance.contentHash, 'string')
+    assert.ok(expanded.value.provenance.contentHash.length > 0, 'no content hash was reported')
+    assert.equal(typeof expanded.value.provenance.indexedAt, 'number')
+    assert.ok(expanded.value.provenance.indexedAt > 0, 'no indexedAt was reported')
+    // The fixture indexes a directory, so the store records `directory`; a file
+    // target records `file`. The assertion names the one the fixture produced
+    // rather than the one that reads better.
+    assert.equal(
+      expanded.value.provenance.sourceType,
+      'directory',
+      JSON.stringify(expanded.value.provenance),
+    )
+    assert.equal(expanded.value.stale, false, 'fresh evidence was reported as stale')
+
+    // Never longer than a fresh read of the same evidence through the store,
+    // and the hash it reports is the hash the store actually holds.
+    const { ContentStore } = await import('../../dist/store.js')
+    const fresh = new ContentStore(path.join(host.stateDir, 'index.sqlite'))
+    try {
+      const record = fresh.evidenceOf(evidenceId)
+      assert.ok(record !== undefined, 'the evidence id is not in the store the host used')
+      assert.ok(
+        expanded.value.text.length <= record.text.length,
+        `the expansion (${expanded.value.text.length}) outgrew the stored chunk (${record.text.length})`,
+      )
+      assert.equal(expanded.value.provenance.contentHash, record.contentHash)
+    } finally {
+      fresh.close()
+    }
+
+    // The ceiling is honoured on request, not merely satisfied by luck: a small
+    // budget is clamped to itself and nothing else slips through.
+    const small = await host.call('ctx_expand', { evidenceId, budgetChars: 64 })
+    assert.equal(small.value.ok, true, JSON.stringify(small.value))
+    assert.ok(small.value.text.length <= 64, `a 64-char budget returned ${small.value.text.length} characters`)
+  } finally {
+    work.cleanup()
+    host.cleanup()
+  }
+})
+
+test('ctx_expand refuses a hostile identifier without leaking file content or a stack', { skip }, async () => {
+  const host = await boot()
+  try {
+    for (const hostile of ['../../etc/passwd', '', 'ev_short', `ev_${'a'.repeat(17)}`]) {
+      const result = await host.call('ctx_expand', { evidenceId: hostile })
+      assert.equal(result.isError, false, `the tool threw for ${JSON.stringify(hostile)}`)
+      assert.equal(result.value.ok, false, `a hostile identifier was accepted: ${JSON.stringify(hostile)}`)
+      assert.equal(result.value.expandable, false)
+      assert.match(result.value.error, /ev_ plus 16 hex characters/)
+      assert.equal(result.value.text, undefined, 'a refusal still carried an expansion body')
+
+      // What the model actually receives: no file content and no stack trace.
+      const rendered = result.content[0].text
+      assert.ok(!rendered.includes('root:'), `the refusal leaked /etc/passwd: ${rendered}`)
+      assert.ok(!rendered.includes('daemon:'), `the refusal leaked /etc/passwd: ${rendered}`)
+      assert.ok(!rendered.includes('/bin/'), `the refusal leaked system paths: ${rendered}`)
+      assert.ok(!/\n\s+at\s/.test(rendered), `a stack trace reached the model: ${rendered}`)
+    }
+  } finally {
+    host.cleanup()
+  }
+})
+
+test('ctx_expand reports an unknown but well-formed id as a bounded refusal', { skip }, async () => {
+  const host = await boot()
+  try {
+    const result = await host.call('ctx_expand', { evidenceId: `ev_${'0'.repeat(16)}` })
+    assert.equal(result.isError, false, JSON.stringify(result.content))
+    assert.equal(result.value.ok, false, 'an id that was never issued reported success')
+    assert.equal(result.value.expandable, false)
+    assert.equal(result.value.evidenceId, `ev_${'0'.repeat(16)}`)
+    assert.match(result.value.error, /no evidence with that id/)
+    assert.ok(
+      typeof result.value.error === 'string' && result.value.error.length <= 200,
+      `the reason is unbounded: ${result.value.error.length} characters`,
+    )
+    assert.equal(result.value.text, undefined)
+  } finally {
+    host.cleanup()
+  }
+})
+
+test('ctx_gc dry run reports the plan and deletes nothing, and an unconfirmed apply refuses', { skip }, async () => {
+  const host = await boot()
+  const work = workFixture('gc')
+  try {
+    fs.writeFileSync(path.join(work.root, 'a.md'), 'gcdryruntoken\n')
+    const indexed = await host.call('ctx_index', { path: work.relative, source: 'gc-src' })
+    assert.ok(indexed.value.chunks > 0)
+
+    const before = await host.call('ctx_stats', {})
+    assert.equal(before.value.ok, true, JSON.stringify(before.value))
+
+    const dry = await host.call('ctx_gc', { dryRun: true })
+    assert.equal(dry.isError, false, JSON.stringify(dry.content))
+    assert.equal(dry.value.ok, true, JSON.stringify(dry.value))
+    assert.equal(dry.value.dryRun, true)
+    assert.equal(dry.value.deleted, 0, 'a dry run reported deletions')
+    // The plan reports all three surfaces, each with the totals a reader needs.
+    for (const key of ['scanned', 'reclaimable', 'protected']) {
+      assert.equal(typeof dry.value[key], 'object', `the plan did not report ${key}`)
+      assert.equal(typeof dry.value[key].records, 'number', `${key}.records is not a number`)
+      assert.equal(typeof dry.value[key].bytes, 'number', `${key}.bytes is not a number`)
+    }
+    assert.ok(dry.value.scanned.records >= 1, 'nothing was scanned')
+    // A freshly indexed project source is protected, not reclaimable: age
+    // never deletes anything on its own.
+    assert.equal(dry.value.reclaimable.records, 0, JSON.stringify(dry.value))
+    assert.equal(dry.value.protected.records, dry.value.scanned.records, JSON.stringify(dry.value))
+    assert.deepEqual(dry.value.candidates, [], 'a dry run named candidates it would not delete')
+    assert.match(dry.content[0].text, /"dryRun": true/)
+
+    const afterDry = await host.call('ctx_stats', {})
+    assert.equal(afterDry.value.index.chunks, before.value.index.chunks, 'the dry run deleted something')
+    assert.equal(afterDry.value.index.sources, before.value.index.sources, 'the dry run dropped a source')
+
+    // An applying run without confirm refuses and still deletes nothing.
+    const refused = await host.call('ctx_gc', { dryRun: false })
+    assert.equal(refused.isError, false, JSON.stringify(refused.content))
+    assert.equal(refused.value.ok, false)
+    assert.equal(refused.value.deleted, 0)
+    assert.equal(refused.value.dryRun, false)
+    assert.match(refused.value.error, /confirm/)
+    assert.match(refused.content[0].text, /nothing was removed/)
+
+    const afterRefused = await host.call('ctx_stats', {})
+    assert.equal(afterRefused.value.index.chunks, before.value.index.chunks, 'an unconfirmed apply deleted something')
+    assert.equal(afterRefused.value.index.sources, before.value.index.sources, 'an unconfirmed apply dropped a source')
+    const stillThere = await host.call('ctx_search', { queries: ['gcdryruntoken'], limit: 5 })
+    assert.equal(stillThere.value.results[0].matches.length, 1, 'the refused apply made the corpus unsearchable')
+  } finally {
+    work.cleanup()
+    host.cleanup()
+  }
+})
+
+test('ctx_gc applying run deletes exactly what its own dry run named', { skip }, async () => {
+  // A window of zero makes an ephemeral record reclaimable the moment it is
+  // written, so the apply path runs deterministically instead of depending on
+  // a wall clock the tool cannot be given.
+  const host = await boot({ retention: { ephemeralMs: 0 } })
+  const work = workFixture('gc-apply')
+  try {
+    fs.writeFileSync(path.join(work.root, 'a.md'), 'ephemeraldeletegone\n')
+    fs.writeFileSync(path.join(work.root, 'b.md'), 'projectsurvivestoken\n')
+    const ephemeral = await host.call('ctx_index', {
+      path: path.join(work.relative, 'a.md'),
+      source: 'gc-ephemeral',
+      sourceType: 'command',
+    })
+    assert.ok(ephemeral.value.chunks > 0, JSON.stringify(ephemeral.value))
+    const kept = await host.call('ctx_index', { path: path.join(work.relative, 'b.md'), source: 'gc-project' })
+    assert.ok(kept.value.chunks > 0, JSON.stringify(kept.value))
+    // The classification comes from the source type, exactly as documented.
+    assert.equal(ephemeral.value.retention, 'ephemeral', JSON.stringify(ephemeral.value))
+
+    const before = await host.call('ctx_stats', {})
+
+    const dry = await host.call('ctx_gc', { dryRun: true })
+    assert.equal(dry.value.ok, true, JSON.stringify(dry.value))
+    assert.equal(dry.value.reclaimable.records, 1, JSON.stringify(dry.value))
+    assert.equal(dry.value.protected.records, 1, JSON.stringify(dry.value))
+    const named = dry.value.candidates.map((candidate) => candidate.id)
+    assert.deepEqual(named, [ephemeral.value.sourceId], 'the plan did not name the ephemeral source')
+    assert.equal(dry.value.candidates[0].kind, 'source')
+    assert.equal(dry.value.candidates[0].class, 'ephemeral')
+
+    const applied = await host.call('ctx_gc', { dryRun: false, confirm: true })
+    assert.equal(applied.isError, false, JSON.stringify(applied.content))
+    assert.equal(applied.value.ok, true, JSON.stringify(applied.value))
+    assert.equal(applied.value.dryRun, false)
+    // Only what the plan named, and only that many.
+    assert.equal(applied.value.deleted, 1, JSON.stringify(applied.value))
+    assert.equal(applied.value.sourcesRemoved, 1)
+    assert.equal(applied.value.eventsRemoved, 0)
+    assert.deepEqual([...applied.value.removedIds], named, 'the apply deleted something the plan never named')
+
+    // ctx_stats agrees with the number the run reported.
+    const after = await host.call('ctx_stats', {})
+    assert.equal(after.value.index.sources, before.value.index.sources - 1, 'the source tally disagrees with the run')
+    assert.equal(
+      after.value.index.chunks,
+      before.value.index.chunks - ephemeral.value.chunks,
+      'the chunk tally disagrees with the number of chunks the removed source held',
+    )
+
+    // The survivor is still reachable; the deleted body is gone.
+    const survived = await host.call('ctx_search', { queries: ['projectsurvivestoken'], limit: 5 })
+    assert.equal(survived.value.results[0].matches.length, 1, 'the kept source was lost')
+    const gone = await host.call('ctx_search', { queries: ['ephemeraldeletegone'], limit: 5 })
+    assert.deepEqual(gone.value.results[0].matches, [], 'the deleted source is still searchable')
+  } finally {
+    work.cleanup()
+    host.cleanup()
+  }
+})
+
+test('ctx_related reports a missing entity and refuses a hostile one', { skip }, async () => {
+  const host = await boot()
+  try {
+    const missing = await host.call('ctx_related', { entity: 'entitythatwasneverindexed' })
+    assert.equal(missing.isError, false, JSON.stringify(missing.content))
+    assert.equal(missing.value.ok, true)
+    assert.equal(missing.value.related, false)
+    assert.deepEqual(missing.value.nodes, [])
+    assert.equal(missing.value.edges, 0)
+    assert.equal(missing.value.truncated, false)
+    assert.match(missing.content[0].text, /"related": false/)
+
+    for (const hostile of ['../../etc/passwd', 'a/b', '']) {
+      const refused = await host.call('ctx_related', { entity: hostile })
+      assert.equal(refused.isError, false, `ctx_related threw for ${JSON.stringify(hostile)}`)
+      assert.equal(refused.value.ok, false, `a hostile entity was accepted: ${JSON.stringify(hostile)}`)
+      assert.equal(refused.value.related, false)
+      assert.equal(
+        refused.value.error,
+        'entity must be a non-empty name of at most 128 characters, with no path separator or parent reference',
+      )
+      assert.deepEqual(refused.value.nodes, [], 'a refusal still walked the graph')
+
+      const rendered = refused.content[0].text
+      assert.ok(!rendered.includes('root:'), `the refusal leaked /etc/passwd: ${rendered}`)
+      assert.ok(!rendered.includes('passwd'), `the refusal echoed the hostile entity: ${rendered}`)
+      assert.ok(!/\n\s+at\s/.test(rendered), `a stack trace reached the model: ${rendered}`)
+    }
+  } finally {
+    host.cleanup()
+  }
+})
+
+/**
+ * A diff answer is bounded and self-consistent.
+ *
+ * The four counters are the true totals across the whole surface while the
+ * entries list is separately bounded, so an untruncated answer must have as
+ * many entries as its counters add up to — that is the assertion that the
+ * reported numbers describe the reported entries rather than being two
+ * unrelated figures.
+ */
+function assertBoundedDiff(diff, label) {
+  const counters = diff.additions + diff.removals + diff.changes + diff.unchanged
+  for (const entry of diff.entries) {
+    assert.ok(entry.key.length <= 160, `${label}: key ${entry.key.length} characters`)
+    if (entry.before !== undefined) {
+      assert.ok(entry.before.length <= 160, `${label}: before ${entry.before.length} characters`)
+    }
+    if (entry.after !== undefined) {
+      assert.ok(entry.after.length <= 160, `${label}: after ${entry.after.length} characters`)
+    }
+    assert.ok(['added', 'removed', 'changed', 'unchanged'].includes(entry.op), `${label}: op ${entry.op}`)
+  }
+  assert.equal(diff.truncated, false, `${label}: the diff was truncated`)
+  assert.equal(
+    diff.entries.length,
+    counters,
+    `${label}: ${diff.entries.length} entries against ${counters} counted: ${JSON.stringify(diff.entries)}`,
+  )
+  return counters
+}
+
+test('ctx_diff reports the real delta in all three modes and refuses an unknown one', { skip }, async () => {
+  const host = await boot({ session: { recordEvents: true } })
+  const work = workFixture('diff')
+  try {
+    fs.mkdirSync(path.join(work.root, 'src'), { recursive: true })
+    fs.writeFileSync(path.join(work.root, 'src', 'a.txt'), 'deltaone\n')
+    fs.writeFileSync(path.join(work.root, 'src', 'b.txt'), 'deltatwo\n')
+    const first = await host.call('ctx_index', {
+      path: path.join(work.relative, 'src', 'a.txt'),
+      source: 'diff-source-a',
+    })
+    const second = await host.call('ctx_index', {
+      path: path.join(work.relative, 'src', 'b.txt'),
+      source: 'diff-source-b',
+    })
+    assert.ok(first.value.chunks > 0 && second.value.chunks > 0)
+
+    const foundA = await host.call('ctx_search', { queries: ['deltaone'], limit: 5 })
+    const foundB = await host.call('ctx_search', { queries: ['deltatwo'], limit: 5 })
+    assert.equal(foundA.value.results[0].matches.length, 1, JSON.stringify(foundA.value.results))
+    assert.equal(foundB.value.results[0].matches.length, 1, JSON.stringify(foundB.value.results))
+    const evidenceA = foundA.value.results[0].matches[0].evidenceId
+    const evidenceB = foundB.value.results[0].matches[0].evidenceId
+
+    // evidence mode: two real ids, and the delta quotes the real bodies.
+    const byEvidence = await host.call('ctx_diff', { mode: 'evidence', before: evidenceA, after: evidenceB })
+    assert.equal(byEvidence.isError, false, JSON.stringify(byEvidence.content))
+    assert.equal(byEvidence.value.ok, true, JSON.stringify(byEvidence.value))
+    assert.equal(byEvidence.value.mode, 'evidence')
+    assert.equal(byEvidence.value.before, evidenceA)
+    assert.equal(byEvidence.value.after, evidenceB)
+    assert.ok(assertBoundedDiff(byEvidence.value, 'evidence') > 0, 'two different chunks produced no delta')
+    const changedEvidence = byEvidence.value.entries.find((entry) => entry.key === '1')
+    assert.ok(changedEvidence, JSON.stringify(byEvidence.value.entries))
+    assert.equal(changedEvidence.op, 'changed', JSON.stringify(changedEvidence))
+    assert.equal(changedEvidence.before, 'deltaone', 'the diff did not report the earlier body')
+    assert.equal(changedEvidence.after, 'deltatwo', 'the diff did not report the later body')
+
+    // source mode: two indexed sources by label.
+    const bySource = await host.call('ctx_diff', { mode: 'source', before: 'diff-source-a', after: 'diff-source-b' })
+    assert.equal(bySource.isError, false, JSON.stringify(bySource.content))
+    assert.equal(bySource.value.ok, true, JSON.stringify(bySource.value))
+    assert.equal(bySource.value.mode, 'source')
+    assert.equal(bySource.value.before, 'diff-source-a')
+    assert.equal(bySource.value.after, 'diff-source-b')
+    assert.equal(bySource.value.sourceTruncated, false, 'a two-line source was reported as clipped')
+    assert.ok(assertBoundedDiff(bySource.value, 'source') > 0, 'two different sources produced no delta')
+    const changedSource = bySource.value.entries.find((entry) => entry.key === '1')
+    assert.equal(changedSource.before, 'deltaone')
+    assert.equal(changedSource.after, 'deltatwo')
+
+    // sessions mode: two sessions this test recorded through the real host.
+    const sessionA = { id: 'sess-diff-a', header: { id: 'sess-diff-a', cwd: process.cwd() } }
+    await host.ctx.emit('session/event', sessionA, {
+      type: 'user/message',
+      seq: 1,
+      time: 1_700_000_000_000,
+      data: { content: [{ type: 'text', text: 'delta session alpha goal' }] },
+    })
+    const sessionB = { id: 'sess-diff-b', header: { id: 'sess-diff-b', cwd: process.cwd() } }
+    await host.ctx.emit('session/event', sessionB, {
+      type: 'user/message',
+      seq: 1,
+      time: 1_700_000_000_000,
+      data: { content: [{ type: 'text', text: 'delta session beta goal' }] },
+    })
+
+    const bySession = await host.call('ctx_diff', { mode: 'sessions', sessionA: 'sess-diff-a', sessionB: 'sess-diff-b' })
+    assert.equal(bySession.isError, false, JSON.stringify(bySession.content))
+    assert.equal(bySession.value.ok, true, JSON.stringify(bySession.value))
+    assert.equal(bySession.value.mode, 'sessions')
+    assert.equal(bySession.value.sessionA, 'sess-diff-a')
+    assert.equal(bySession.value.sessionB, 'sess-diff-b')
+    const sessionCounters = assertBoundedDiff(bySession.value, 'sessions')
+    assert.ok(sessionCounters > 0, 'two different sessions produced no delta')
+    const quoted = bySession.value.entries
+      .map((entry) => `${entry.before ?? ''}|${entry.after ?? ''}`)
+      .join('\n')
+    assert.match(quoted, /delta session alpha goal/, `the session diff did not quote the stored text: ${quoted}`)
+    assert.match(quoted, /delta session beta goal/, `the session diff did not quote the stored text: ${quoted}`)
+
+    // An unknown mode is refused, and the refusal reaches the model.
+    const unknown = await host.call('ctx_diff', { mode: 'everything' })
+    assert.equal(unknown.isError, false, JSON.stringify(unknown.content))
+    assert.equal(unknown.value.ok, false)
+    assert.equal(unknown.value.mode, 'everything')
+    assert.match(unknown.value.error, /mode must be sessions, evidence or source/)
+    assert.match(unknown.content[0].text, /mode must be sessions, evidence or source/)
+  } finally {
+    work.cleanup()
+    host.cleanup()
+  }
+})
+
+test('ctx_search answers a historical query and reports a malformed window instead of throwing', { skip }, async () => {
+  const host = await boot()
+  const work = workFixture('temporal')
+  try {
+    fs.mkdirSync(path.join(work.root, 'docs'), { recursive: true })
+    fs.writeFileSync(path.join(work.root, 'docs', 'a.md'), 'temporalordering alpha\n')
+    fs.writeFileSync(path.join(work.root, 'docs', 'b.md'), 'temporalordering beta\n')
+    await host.call('ctx_index', { path: path.join(work.relative, 'docs', 'a.md'), source: 'temporal-a' })
+    await host.call('ctx_index', { path: path.join(work.relative, 'docs', 'b.md'), source: 'temporal-b' })
+
+    const historical = await host.call('ctx_search', { queries: ['temporalordering'], limit: 5, temporal: 'historical' })
+    assert.equal(historical.isError, false, JSON.stringify(historical.content))
+    assert.equal(historical.value.ok, true, JSON.stringify(historical.value))
+    const first = historical.value.results[0]
+    assert.equal(first.temporal.mode, 'historical', 'the requested mode was not the one reported')
+    // Bounded: the hits and the hints, and every excerpt inside its budget.
+    assert.ok(first.matches.length <= 5, `${first.matches.length} hits for limit 5`)
+    for (const match of first.matches) {
+      assert.ok(match.snippet.length <= 240, `snippet is ${match.snippet.length} characters`)
+      assert.match(match.evidenceId, /^ev_[0-9a-f]{16}$/)
+    }
+    assert.ok(first.hints.length <= 3, `${first.hints.length} hints`)
+    // The mode is a decision the model can see, so it is reported when it bites.
+    assert.ok(
+      first.hints.some((hint) => /historical order/.test(hint)),
+      `the historical ordering was never surfaced: ${JSON.stringify(first.hints)}`,
+    )
+    assert.match(historical.content[0].text, /temporalordering/)
+
+    // A malformed `before` is documented behaviour, not an error: the call
+    // succeeds, the window is dropped, and one bounded hint names the field.
+    const malformed = await host.call('ctx_search', { queries: ['temporalordering'], limit: 5, before: 'not-a-timestamp' })
+    assert.equal(malformed.isError, false, JSON.stringify(malformed.content))
+    assert.equal(malformed.value.ok, true, 'a malformed window turned into a failed call')
+    const rejected = malformed.value.results[0]
+    assert.deepEqual(rejected.matches, [], 'a rejected window still returned hits')
+    assert.equal(rejected.temporal.mode, 'any', 'a rejected filter was reported as applied')
+    assert.equal(rejected.cache.stored, false, 'a rejected window was cached')
+    assert.equal(rejected.hints.length, 1, JSON.stringify(rejected.hints))
+    assert.match(rejected.hints[0], /\(before\)/, `the hint does not name the field: ${rejected.hints[0]}`)
+    assert.ok(rejected.hints[0].length <= 160, `the hint is ${rejected.hints[0].length} characters`)
+    assert.match(malformed.content[0].text, /temporal filter rejected \(before\)/)
+  } finally {
+    work.cleanup()
     host.cleanup()
   }
 })

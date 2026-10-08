@@ -1,7 +1,7 @@
 # dsh-context-optimizer
 
 Plugin untuk [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) yang
-memberi agent sepuluh tool bernama `ctx_*`. Tujuannya satu: menjaga jendela konteks (context
+memberi agent empat belas tool bernama `ctx_*`. Tujuannya satu: menjaga jendela konteks (context
 window) tetap berisi informasi yang berguna, bukan tumpukan output mentah.
 
 Kalau agent menjalankan `cat data.json` pada berkas 3 MB, 3 MB itu masuk permanen ke percakapan
@@ -117,7 +117,7 @@ konfigurasi. Berkas patch plugin ini adalah `cordis.patch.yml`, ditunjuk dari `p
 
 **3. Tool.**
 Tool adalah fungsi bernama yang bisa dipanggil model, lengkap dengan skema JSON untuk
-argumennya. Plugin ini mendaftarkan sepuluh tool, semuanya berawalan `ctx_` secara bawaan.
+argumennya. Plugin ini mendaftarkan empat belas tool, semuanya berawalan `ctx_` secara bawaan.
 Tool ini muncul di daftar tool yang sama dengan `bash`, `read`, dan tool bawaan host
 lainnya. Panggilannya dilakukan oleh model, bukan oleh Anda lewat terminal.
 
@@ -133,7 +133,7 @@ di luar workspace. Plugin ini tidak %),mj Henancrementimplementasinya sendiri, d
 layanan itu ke host. Kalau host tidak punya, tool eksekusi kode **menolak**, bukan melepas
 batasnya.
 
-## 1.5 Fitur utama (sepuluh tool)
+## 1.5 Fitur utama (empat belas tool)
 
 Semua nama mengikuti awalan `toolPrefix`, bawaannya `ctx_`.
 
@@ -143,12 +143,20 @@ Semua nama mengikuti awalan `toolPrefix`, bawaannya `ctx_`.
 | `ctx_execute_file` | Sama seperti di atas, tapi satu berkas proyek tersedia sebagai env `TARGET_FILE` | Ya |
 | `ctx_batch_execute` | Jalankan beberapa perintah shell paralel, indeks semua output, kembalikan cuplikan per query | Tidak langsung |
 | `ctx_index` | Indeks berkas atau direktori ke penyimpanan full-text persisten | Tidak |
-| `ctx_search` | Cari korpus terindeks dengan peringkat BM25, kembalikan cuplikan bertanda | Tidak |
+| `ctx_search` | Cari korpus terindeks, kembalikan cuplikan bertanda plus provenance, skor kualitas, dan kontradiksi | Tidak |
 | `ctx_fetch_and_index` | Ambil satu URL, indeks teksnya, kembalikan ringkasan + hasil query | Tidak |
+| `ctx_expand` | Perluas satu evidence id atau satu source jadi payload berlipat (L0 metadata ... L4 mentah) | Tidak |
+| `ctx_gc` | Laporkan atau terapkan kebijakan retensi: apa yang bisa diambil kembali, apa yang dilindungi | Tidak |
+| `ctx_diff` | Bedakan dua snapshot sesi, dua evidence, atau dua versi terindeks satu source | Tidak |
+| `ctx_related` | Telusuri graf relasi dari satu entity dengan batas kedalaman dan jumlah node | Tidak |
 | `ctx_resume` | Bangun ulang snapshot sesi dan kembalikan isinya | Tidak |
-| `ctx_stats` | Laporan isi kedua store dan penggunaan disk | Tidak |
-| `ctx_doctor` | Cek mandiri: sandbox, 12 runtime bahasa, kesehatan store, seluruh error | Tidak |
+| `ctx_stats` | Laporan isi kedua store, cache, relasi, anggaran, dan data yang bisa di-GC | Tidak |
+| `ctx_doctor` | Cek mandiri: sandbox, 12 runtime bahasa, versi skema, cache, relasi, seluruh error | Tidak |
 | `ctx_purge` | Kosongkan indeks, log sesi, atau keduanya (butuh `confirm: true`) | Tidak |
+
+Sepuluh tool pertama sudah ada sebelum infrastruktur konteks ditambahkan; empat terakhir ada
+karena retrieval menjadi sesuatu yang bisa **diperluas**, **dibersihkan**, **dibedakan**, dan
+**ditelusuri**, bukan hanya ditanya.
 
 ---
 
@@ -543,6 +551,26 @@ key yang tepat yang diterima resolver:
           maxEventsPerSession: 5000    # baris tertua dipangkas lewat ini
           maxSnapshotChars: 2048       # plafon keras untuk snapshot yang disuntikkan
           injectSnapshot: true         # suntikkan snapshot saat prompt dirakit
+        contextBudget:
+          enabled: true                # setiap payload tahu anggarannya sendiri
+          totalChars: 12000            # plafon total satu payload, sebelum cadangan
+          reserveChars: 2000           # karakter yang tidak pernah dialokasikan
+          weights:                     # porsi RELATIF, bukan persentase
+            recent: 0.2                #   bukti yang baru terlihat
+            task: 0.3                  #   tugas yang sedang dikerjakan sesi
+            evidence: 0.35             #   bukti hasil retrieval
+            metadata: 0.15             #   provenance dan struktur
+        cache:
+          enabled: true                # cache retrieval lokal di SQLite
+          ttlMs: 300000                # umur satu entri cache
+          maxEntries: 1000             # batas jumlah entri
+        retention:
+          ephemeralMs: 86400000        # output perintah sekali pakai (0 = tak pernah)
+          sessionMs: 604800000         # baris milik satu sesi
+          projectMs: 2592000000        # isi proyek yang terindeks
+        relations:
+          maxDepth: 2                  # hop maksimum satu penelusuran graf
+          maxNodes: 50                 # node maksimum satu penelusuran graf
 ```
 
 Contoh konfigurasi yang aman untuk pemakaian biasa: salin blok di atas apa adanya, ganti satu
@@ -593,7 +621,7 @@ akan menjatuhkan seluruh profil. Yang ditolak secara spesifik:
 | Key | Tipe | Bawaan | Arti |
 | --- | --- | --- | --- |
 | `stateDir` | string | `$DSH_HOME/dsh-context-optimizer` | Lokasi dua berkas SQLite |
-| `toolPrefix` | string | `ctx_` | Awalan pada sepuluh nama tool |
+| `toolPrefix` | string | `ctx_` | Awalan pada empat belas nama tool |
 | `executor.defaultTimeoutMs` | integer positif | `30000` | Anggaran waktu per eksekusi |
 | `executor.maxStdoutBytes` | integer positif | `8192` | Anggaran stdout sebelum pemotongan kepala+ekor |
 | `executor.maxStderrBytes` | integer positif | `4096` | Anggaran stderr |
@@ -611,7 +639,27 @@ akan menjatuhkan seluruh profil. Yang ditolak secara spesifik:
 | `session.maxEventsPerSession` | integer non-negatif | `5000` | Baris tertua dipangkas lewat ini |
 | `session.maxSnapshotChars` | integer positif | `2048` | Plafon keras snapshot yang disuntikkan |
 | `session.injectSnapshot` | boolean | `true` | Suntikkan snapshot saat prompt dirakit |
+| `contextBudget.enabled` | boolean | `true` | Setiap payload menghitung anggarannya lewat `src/budget.ts` |
+| `contextBudget.totalChars` | integer positif | `12000` | Plafon karakter satu payload, sebelum cadangan |
+| `contextBudget.reserveChars` | integer non-negatif | `2000` | Karakter yang tidak pernah dialokasikan; harus lebih kecil dari `totalChars` |
+| `contextBudget.weights.recent` | number 0..1 | `0.2` | Porsi relatif bukti yang baru terlihat |
+| `contextBudget.weights.task` | number 0..1 | `0.3` | Porsi relatif tugas sesi |
+| `contextBudget.weights.evidence` | number 0..1 | `0.35` | Porsi relatif bukti hasil retrieval |
+| `contextBudget.weights.metadata` | number 0..1 | `0.15` | Porsi relatif provenance dan struktur |
+| `cache.enabled` | boolean | `true` | Cache retrieval lokal di SQLite |
+| `cache.ttlMs` | integer positif | `300000` | Umur satu entri cache |
+| `cache.maxEntries` | integer positif | `1000` | Batas jumlah entri; entri tertua dikeluarkan lebih dulu |
+| `retention.ephemeralMs` | integer non-negatif | `86400000` | Umur setelah output perintah sekali pakai bisa di-GC |
+| `retention.sessionMs` | integer non-negatif | `604800000` | Umur setelah baris milik satu sesi bisa di-GC |
+| `retention.projectMs` | integer non-negatif | `2592000000` | Umur setelah isi proyek terindeks bisa di-GC; `0` berarti tak pernah |
+| `relations.maxDepth` | integer 1..5 | `2` | Hop maksimum satu penelusuran graf |
+| `relations.maxNodes` | integer 1..500 | `50` | Node maksimum satu penelusuran graf |
 | `fetch.allowHosts` | array string | `[]` | Host yang dikecualikan dari Penjaga alamat privat |
+
+Bobot anggaran bersifat **relatif**, bukan persentase: `src/budget.ts` menormalkannya, jadi
+`evidence: 7` dengan tiga lainnya bawaan tetap sah. Yang ditolak adalah bobot negatif, bukan
+jumlah selain 1. Nilai `0` pada `retention.*Ms` berarti "tak pernah dibuang karena umur" dan itu
+nilai yang didokumentasikan, bukan sakelar tersembunyi.
 
 ## 4.6 Cara kerja hint routing
 
@@ -622,9 +670,21 @@ per `advisoryThrottle` pemanggilan cocok. Panggilan itu sendiri tidak pernah dib
 | Anda memanggil | Dengan | Hint menyarankan |
 | --- | --- | --- |
 | `web_fetch` atau `read_page` | | `ctx_fetch_and_index` |
+| `read` | `file_path` tanpa `offset` dan tanpa `limit` | `ctx_index` |
 | `bash` atau `shell` | perintah diawali `curl` atau `wget` | `ctx_fetch_and_index` |
 | `bash` atau `shell` | `cat something.log/.json/.csv/.jsonl` | `ctx_batch_execute` |
 | `grep` | | `ctx_search` |
+
+Aturan `read` hanya menyala untuk pembacaan **seluruh berkas**. Host membatasi `read` pada
+sejumlah baris, jadi membaca berkas kecil memang murah dan tidak diarahkan; yang dialihkan hanya
+panggilan yang tidak meminta offset maupun limit sama sekali.
+
+Aturan ini bukan daftar lengkap alur kerja. Empat alur lainnya — query berulang, pertanyaan
+historis, bukti yang bertentangan, dan simbol yang berelasi — bukan properti dari **bentuk
+panggilan**, melainkan dari apa yang retrieval kembalikan. Karena itu keempatnya dilaporkan
+sebagai `hints` pada hasil `ctx_search` (dan `ctx_batch_execute`), bukan ditebak dari argumen:
+aturan yang menebak intent dari nama tool akan menyala pada panggilan yang salah dan diam pada
+yang benar.
 
 Penolakan berdiri sendiri dan sepenuhnya opt-in. `routing.denyPatterns` kosong secara bawaan,
 dan tiap entri adalah regex yang dicocokkan ke argumen `command` milik panggilan. Kecocokan
@@ -654,14 +714,35 @@ ls -la "$DSH_HOME/dsh-context-optimizer"
 
 ## 5.2 Migration, seeding, initialization
 
-**Tidak ada.** Tidak ada folder `migrations/`, tidak ada perintah migrate, tidak ada seed file.
+**Ada, dan berversi.** `src/migration.ts` menjalankan langkah bernomor per berkas store.
 
-- Skema tabel dibuat sendiri saat store dibuka untuk pertama kali (dibuat dan diisi dalam satu
-  transaksi, jadi kegagalan di tengah tidak meninggalkan tabel separuh jadi).
-- Data awal juga tidak ada. Indeks mulai kosong. Pada mesin acuan, setelah instalasi tapi
-  sebelum ada pemanggilan, `ctx_stats` melaporkan `sources: 0, chunks: 0`.
-- Skema tidak berversi. Kalau schema berubah di masa depan, indeks lokal perlu dihapus dan
-  dibangun ulang lewat `ctx_purge`.
+- Tiap store punya tabel `schema_migrations(version, name, applied_at)`. Versi yang tercatat
+  adalah sumber kebenaran, bukan bentuk tabel yang kebetulan ada.
+- Setiap langkah berjalan di dalam SATU transaksi (`BEGIN IMMEDIATE` ... `COMMIT`). Langkah yang
+  gagal di-rollback dan `migrate` melempar `MigrationError` yang menyebut berkas dan nomor
+  versinya. Database tetap berada di versi sebelumnya dengan datanya utuh — itu satu-satunya
+  keadaan dari mana percobaan ulang atau rebuild masih mungkin.
+- Dua langkah dengan nomor versi sama ditolak sebelum SQL apa pun dijalankan.
+- Tidak ada seed. Indeks mulai kosong.
+
+### Apa yang terjadi pada database v0.1
+
+Database yang ditulis versi 0.1 punya tabel tapi belum punya baris versi. Runner **mencapinya
+sebagai versi 1** (baseline yang sudah dipenuhinya), lalu menjalankan langkah 2:
+
+- kolom provenance dan temporal ditambahkan ke `sources`,
+- tabel `chunk_meta` dibuat,
+- **hash tiap chunk dihitung dari teks yang benar-benar masih disimpan oleh FTS5**, jadi hash-nya
+  menggambarkan korpus yang ada, bukan korpus hasil rebuild,
+- `line_start` dan `line_end` sengaja dibiarkan `NULL`: indeks lama tidak menyimpan offset per
+  berkas, dan nomor baris yang dikarang sekarang tidak bisa dibedakan dari yang asli nanti.
+
+Terverifikasi langsung: sebuah store v0.1 berisi satu source dengan satu chunk tetap punya
+`sources: 1, chunks: 1` setelah migrasi, isinya tetap bisa dicari, hash-nya terisi 64 heksadesimal,
+dan `line_start` tidak ada. Membuka store yang sama dua kali tidak menerapkan langkah apa pun.
+
+Kalau migrasi gagal, `apply` menangkapnya, merekam alasannya, dan menonaktifkan plugin dengan pesan —
+sama seperti konfigurasi yang rusak. Jalur rebuild yang eksplisit tetap `ctx_purge`.
 
 ## 5.3 Layanan eksternal
 
@@ -728,7 +809,7 @@ sampai profil di-restart, dan repository ini tidak pernah menjalankan restart un
 Semua empat tanda berikut harus benar. Keempatnya terukur langsung pada host acuan,
 2026-10-07.
 
-1. **Tool muncul di daftar tool.** Sepuluh nama `ctx_*` ada berdampingan dengan `bash`, `read`,
+1. **Tool muncul di daftar tool.** Empat belas nama `ctx_*` ada berdampingan dengan `bash`, `read`,
    dan tool bawaan lain.
 2. **`ctx_doctor` menjawab `ok: true`.**
 3. **Panggilan kode pertama berhasil.** Minta agent menjalankan
@@ -974,6 +1055,30 @@ Argumen `ctx_search`:
 | `limit` | integer | tidak | `search.defaultLimit` (5) | Di-clamp ke `search.maxLimit` (50) |
 | `source` | string | tidak | semua source | Batasi ke satu sumber terindeks |
 | `sort` | `relevance` atau `timeline` | tidak | `relevance` | `timeline` berarti chunk terbaru dulu |
+| `temporal` | `any`, `latest`, atau `historical` | tidak | `any` | `latest` menaruh chunk terbaru di depan, `historical` yang tertua |
+| `before` | ISO-8601 atau epoch ms | tidak | | Hanya bukti yang ditulis pada atau sebelum waktu itu |
+| `after` | ISO-8601 atau epoch ms | tidak | | Hanya bukti yang ditulis pada atau setelah waktu itu |
+| `sessionId` | string | tidak | | Hanya bukti yang diindeks untuk sesi itu |
+| `noCache` | boolean | tidak | `false` | Lewati cache retrieval untuk panggilan ini |
+
+Kalau `before` lebih besar dari `after`, panggilan **ditolak** dengan alasan yang menyebut field-nya.
+Frasa relatif seperti `last week` atau `kemarin` sengaja tidak diterjemahkan: frasa seperti itu
+harus dievaluasi terhadap jam yang tidak dimiliki tool, jadi pemanggil harus menyerahkan
+timestamp.
+
+### Yang ditambahkan pada hasil `ctx_search`
+
+Setiap hasil kini membawa, selain `matches`:
+
+- `provenance` di setiap hit: `evidenceId`, `sourceId`, `chunkId`, `contentHash`, `updatedAt`,
+  `firstSeenAt`, `sourceType`, dan `lineStart`/`lineEnd` **hanya bila sumbernya punya metadata baris
+  yang sesungguhnya**. Nomor baris tidak pernah dikarang.
+- `quality`: skor deterministik (`relevance`, `freshness`, `coverage`, `diversity`,
+  `contradictionPenalty`, `overall`), dibulatkan ke 2 desimal. Bukan probabilitas kebenaran.
+- `contradictions`: konflik berkeyakinan tinggi yang ditemukan di antara hit yang dikembalikan.
+- `temporal`: filter yang benar-benar dipakai setelah parsing.
+- `cache`: `hit`, `key`, dan apakah payload disimpan.
+- `hints`: paling banyak tiga baris singkat yang mengatakan apa yang bisa dilakukan berikutnya.
 
 Peringkatannya FTS5 BM25, jadi ini peringkat relevansi sungguhan dengan stemming, bukan
 sekadar menghitung substring. Term yang cocok dibungkus `»` dan `«`; `…` menandai teks yang
@@ -1062,6 +1167,104 @@ Section ditambahkan sesuai urutan di atas sampai anggaran `session.maxSnapshotCh
 tetapi `classifyEvent` hanya menghasilkan empat kategori di atas. Perlakukan sebagai tempat
 cadangan, bukan fitur.
 
+## 7.7b Perluas bukti: `ctx_expand`
+
+```json
+{ "evidenceId": "ev_c9e87c7e4f13583c" }
+{ "sourceId": "src_01097f88dc0b1314" }
+{ "evidenceId": "ev_c9e87c7e4f13583c", "level": 1, "budgetChars": 500 }
+```
+
+| Argumen | Tipe | Wajib | Bawaan | Arti |
+| --- | --- | --- | --- | --- |
+| `evidenceId` | string | ya* | | Satu evidence id dari hasil pencarian sebelumnya |
+| `sourceId` | string | ya* | | Satu source id, untuk mendaftar isi source itu |
+| `level` | integer 0..4 | tidak | `4` untuk evidence, `0` untuk source | L0 metadata, L1 struktur, L2 ringkasan, L3 kutipan, L4 mentah |
+| `budgetChars` | integer | tidak | potongan bukti dari `contextBudget` | Plafon karakter payload yang dikembalikan |
+| `maxChunks` | integer | tidak | 50 | Chunk yang didaftarkan untuk ekspansi source |
+| `seenHash` | string | tidak | | Hash dari retrieval sebelumnya, untuk mendeteksi drift |
+
+\* Salah satu dari `evidenceId` atau `sourceId` wajib.
+
+Poin yang paling penting: **argumennya selalu identifier, bukan isi.** Pemanggil tidak pernah
+mengirim ulang badan dokumen — kalau harus, seluruh maksud mengindeksnya hilang. Kenapa itu aman:
+id hanya dipakai sebagai pembanding kesetaraan di dalam SQL, dengan validasi bentuk
+`ev_`/`src_` plus 16 heksadesimal lebih dulu. Karena itu ia tidak bisa menjadi path.
+
+Setiap ekspansi tetap terbatas: L4 (mentah) dipotong pada `budgetChars` **dan** pada
+`MAX_EXPANSION_CHARS`, mana saja yang lebih kecil. Plafon bawaan yang terukur pada konfigurasi
+standar adalah 3500 karakter.
+
+Perluasan source mendaftar chunk-nya beserta `evidenceId`, `charLen`, dan `lineStart`/`lineEnd`,
+tanpa menyertakan teksnya. Model lalu memilih chunk yang mau dibaca. Itu yang membuat dokumen
+besar tidak pernah masuk ke konteks sekaligus.
+
+## 7.7c Bersihkan data lama: `ctx_gc`
+
+```json
+{ "dryRun": true }
+{ "dryRun": false, "confirm": true, "maxDeletes": 20 }
+{ "dryRun": false, "confirm": true, "protect": ["src_01097f88dc0b1314"] }
+```
+
+| Argumen | Tipe | Wajib | Bawaan | Arti |
+| --- | --- | --- | --- | --- |
+| `dryRun` | boolean | tidak | `true` | Laporkan saja, jangan hapus |
+| `confirm` | boolean | tidak | `false` | Harus `true` untuk run yang benar-benar menghapus |
+| `maxDeletes` | integer | tidak | 1000 | Plafon record yang boleh dihapus sekali panggil |
+| `protect` | array string | tidak | `[]` | Source atau evidence id yang harus dipertahankan |
+
+Dua flag, bukan satu: run yang menghapus butuh `confirm: true` **dan** `dryRun: false`. Dry run
+tetap mendaftar kandidatnya — rencana yang hanya bicara setelah menghapus adalah rencana yang
+tidak bisa diperiksa.
+
+Aturan yang membuat tool ini aman dipakai: **usia tidak pernah menghapus apa pun sendirian.**
+Satu record bisa diambil kembali hanya bila ia lama DAN tidak dirujuk DAN bukan `persistent`.
+Record yang dirujuk tetap dilindungi pada umur berapa pun. Yang dihitung sebagai rujukan adalah
+edge graf yang menunjuk ke salah satu chunk-nya, dan apa pun yang pemanggil sebutkan di `protect`.
+
+Balasan melaporkan `scanned`, `reclaimable`, `protected`, dan berapa yang benar-benar dihapus.
+`ctx_stats` melaporkan angka ringkas berbasis sampungan terbatas; `ctx_gc` dry run yang membaca
+semua baris.
+
+## 7.7d Bedakan apa yang berubah: `ctx_diff`
+
+```json
+{ "mode": "sessions", "sessionA": "sess-a", "sessionB": "sess-b" }
+{ "mode": "evidence", "before": "ev_aaa", "after": "ev_bbb" }
+{ "mode": "source", "before": "project:app", "after": "project:app-after-refactor" }
+```
+
+| Argumen | Tipe | Wajib | Arti |
+| --- | --- | --- | --- |
+| `mode` | `sessions`, `evidence`, atau `source` | ya | Kedua sisi berupa apa |
+| `sessionA`, `sessionB` | string | untuk `sessions` | Dua id sesi |
+| `before`, `after` | string | untuk `evidence` dan `source` | Evidence id atau label source |
+| `maxEntries` | integer | tidak | Plafon entri diff; bawaan 20, clamp 0..100 |
+
+Hasilnya hanya daftar `added`/`removed`/`changed`/`unchanged` yang terbatas, bukan salinan salah
+satu sisi. Perbandingan nilainya sengaja **literal**: detektor parafrase akan menebak makna yang
+tidak bisa dipertanggungjawabkan modul ini. Tiap `key`, `before`, dan `after` dipotong pada
+`MAX_DIFF_ENTRY_CHARS` (160 karakter), sementara keempat penghitung tetap melaporkan total
+sebenarnya — entri yang dibatasi dan jumlah yang sebenarnya adalah dua hal yang berbeda.
+
+## 7.7e Telusuri relasi: `ctx_related`
+
+```json
+{ "entity": "authenticate", "depth": 2, "limit": 20 }
+```
+
+| Argumen | Tipe | Wajib | Bawaan | Arti |
+| --- | --- | --- | --- | --- |
+| `entity` | string | ya | | Nama entity: fungsi, modul, simbol |
+| `depth` | integer | tidak | `relations.maxDepth` | Hop yang ditelusuri, di-clamp ke konfigurasi dan ke 3 |
+| `limit` | integer | tidak | `relations.maxNodes` | Plafon node yang dikembalikan |
+
+Entity adalah token buram, bukan path: `normalizeEntity` menolak pemisah path, `..`, token
+kosong, dan nama lebih panjang dari 128 karakter. Penelusuran adalah BFS berbatas dengan
+himpunan visited, jadi graf bersiklik tetap berhenti dan setiap entity muncul sekali. Setiap node
+membawa `evidenceId` edge yang mencapainya, sehingga jawaban relasi tetap bisa dilacak.
+
 ## 7.8 Lihat isi store: `ctx_stats`
 
 ```json
@@ -1085,6 +1288,18 @@ Hasil nyata terukur setelah rangkaian pengujian:
 `bytes` sengaja menyertakan WAL dan shm. Mengukur hanya berkas utama akan melapor sekitar
 40% lebih kecil selagi write-ahead log belum di-checkpoint.
 
+Field baru yang perlu diperhatikan:
+
+- `index.evidence` dan `index.stale`: berapa chunk yang punya baris provenance, dan berapa yang
+  hash-nya tidak lagi cocok dengan teks yang disimpan. `stale` bukan nol pada korpus sehat
+  berarti ada yang menulis di luar store.
+- `index.corpusVersion`: naik setiap kali isi berubah. Cache retrieval memakainya sebagai kunci.
+- `contextBudget`: utilisasi anggaran (`totalChars`, `usableChars`, bobot yang dinormalkan).
+- `cache`: hit, miss, jumlah entri, dan berapa yang dikeluarkan.
+- `relations`: jumlah edge dan entity.
+- `gc`: record dan byte yang bisa diambil kembali, ditandai `sampled: true` kalau angkanya berasal
+  dari sampungan terbatas.
+
 ## 7.9 Menghapus: `ctx_purge`
 
 ```json
@@ -1106,24 +1321,38 @@ tidak dikenal menghapus apa pun dan mengatakannya:
 ```
 ds-context-optimizer/
 ├── src/
-│   ├── index.ts          # entry plugin: definisi sepuluh tool, hook, fetch dan Penjaga URL
-│   ├── config.ts         # DEFAULT_CONFIG plus validasi resolveConfig
-│   ├── executor.ts       # SandboxExecutor: spawn terkurung, env allowlist, timeout
-│   ├── host.ts           # kontrak host DSH yang dituju, diketik manual
-│   ├── runtime.ts        # spesifikasi argv per bahasa dan probe PATH
-│   ├── security.ts       # resolveProjectPath: confinemen path berbasis realpath
-│   ├── store.ts          # ContentStore: chunking plus pencarian FTS5/BM25
-│   ├── truncate.ts       # koleksi stdout/stderr berbatas, potongan ekor aman UTF-8
-│   ├── types.ts          # tipe hasil dan kebijakan yang dipakai bersama
+│   ├── index.ts              # entry plugin: definisi 14 tool, hook, fetch, Penjaga URL
+│   ├── config.ts             # DEFAULT_CONFIG plus validasi resolveConfig
+│   ├── executor.ts           # SandboxExecutor: spawn terkurung, env allowlist, timeout
+│   ├── host.ts               # kontrak host DSH yang dituju, diketik manual
+│   ├── runtime.ts            # spesifikasi argv per bahasa dan probe PATH
+│   ├── security.ts           # resolveProjectPath: confinemen path berbasis realpath
+│   ├── migration.ts          # schema_version, langkah bernomor, migrasi atomik
+│   ├── store.ts              # ContentStore: chunking, FTS5/BM25, provenance, temporal
+│   ├── truncate.ts           # koleksi stdout/stderr berbatas, potongan ekor aman UTF-8
+│   ├── types.ts              # tipe hasil dan kebijakan yang dipakai bersama
+│   ├── budget.ts             # anggaran konteks terpusat: alokasi, clamp, ukuran
+│   ├── fold.ts               # lipatan hierarkis L0..L4 dan parser id ekspansi
+│   ├── provenance.ts         # derivasi sourceId/chunkId/evidenceId dan hash
+│   ├── temporal.ts           # filter waktu, urutan, dan peluruhan kebaruan
+│   ├── contradiction.ts      # deteksi kontradiksi deterministik, tanpa LLM
+│   ├── cache.ts              # cache retrieval di SQLite: TTL, batas, invalidasi
+│   ├── gc.ts                 # perencanaan retensi: dry run, hitungan, perlindungan
+│   ├── diff.ts               # diff ringkas dua snapshot / bukti / versi source
+│   ├── quality.ts            # skor kualitas retrieval deterministik
+│   ├── graph.ts              # tabel relasi plus penelusuran BFS berbatas
+│   ├── retrieval.ts          # SATU pipeline retrieval: cache, temporal, kualitas, kontradiksi
 │   ├── routing/
-│   │   ├── engine.ts     # evaluate() murni: keputusan allow / advisory / deny
-│   │   └── throttle.ts   # AdvisoryThrottle: membatasi frekuensi hint
-│   └── session/
-│       ├── db.ts         # SessionDB: kejadian dan snapshot di node:sqlite
-│       └── snapshot.ts   # classifyEvent, eventContent, buildSnapshot
+│   │   ├── engine.ts         # evaluate() murni: keputusan allow / advisory / deny
+│   │   └── throttle.ts       # AdvisoryThrottle: membatasi frekuensi hint
+│   ├── session/
+│   │   ├── db.ts             # SessionDB: kejadian dan snapshot di node:sqlite
+│   │   └── snapshot.ts       # classifyEvent, eventContent, buildSnapshot
+│   └── tools/
+│       └── infrastructure.ts # ctx_expand, ctx_gc, ctx_diff, ctx_related
 ├── test/
-│   ├── unit/             # 8 berkas, 129 test, tanpa butuh host
-│   └── host/             # 3 berkas, 47 test, Context cordis sungguhan dan bwrap sungguhan
+│   ├── unit/             # 22 berkas, 317 test, tanpa butuh host
+│   └── host/             # 3 berkas, 55 test, Context cordis sungguhan dan bwrap sungguhan
 ├── dist/                 # hasil build, di-gitignore
 ├── cordis.patch.yml      # baris loader plus template konfigurasi terkomentari
 ├── package.json
@@ -1190,8 +1419,9 @@ konsistensi gaya, repo ini mengandalkan `strict: true` di `tsconfig.json` sebaga
 
 ## 9.3 Perintah database
 
-Tidak ada, dan itu disengaja. Skema dibuat sendiri saat store pertama kali dibuka; tidak ada
-migration, tidak ada seed.
+Tidak ada perintah database, dan itu disengaja: tidak ada CLI migrate, tidak ada seed. Skema
+dibawa ke versi terbaru otomatis saat store dibuka (`src/migration.ts`), dan versinya terlihat
+di `ctx_doctor` pada field `schema`.
 
 ---
 
@@ -1208,7 +1438,7 @@ npm run typecheck   # hanya cek tipe
 
 ## 10.2 Angka hasil ukur
 
-Dihitung ulang per berkas pada 2026-10-07 di mesin acuan (Node v24.19.0):
+Dihitung ulang per berkas pada sesi perubahan infrastruktur konteks, di mesin acuan (Node v24.19.0). Semua angka di bawah adalah keluaran `node --test` per berkas, bukan kira-kira:
 
 | Berkas test | tests | pass | skip | Cakupannya |
 | --- | --- | --- | --- | --- |
@@ -1217,15 +1447,36 @@ Dihitung ulang per berkas pada 2026-10-07 di mesin acuan (Node v24.19.0):
 | `test/unit/executor.test.mjs` | 30 | 30 | 0 | spawn, abort, timeout, env allowlist, pinning HOME dan TARGET_FILE, probe runtime |
 | `test/unit/security.test.mjs` | 17 | 17 | 0 | `resolveProjectPath` melawan traversal, symlink keluar, path hilang |
 | `test/unit/store.test.mjs` | 17 | 17 | 0 | chunking, peringkat BM25, cuplikan, atomisitas transaksi, purge |
+| `test/unit/migration.test.mjs` | 7 | 7 | 0 | basis data kosong, basis data v0.1, migrasi berulang, migrasi gagal |
+| `test/unit/budget.test.mjs` | 20 | 20 | 0 | alokasi normal, anggaran mungil, bobot nol, pembulatan, determinisme |
+| `test/unit/fold.test.mjs` | 10 | 10 | 0 | setiap level L0..L4, parser id ekspansi, klip aman surrogate |
+| `test/unit/provenance.test.mjs` | 16 | 16 | 0 | id stabil, hash, deteksi stale, metadata opsional yang tidak dikarang |
+| `test/unit/temporal.test.mjs` | 33 | 33 | 0 | parsing filter, batas inklusif, urutan, peluruhan kebaruan |
+| `test/unit/contradiction.test.mjs` | 16 | 16 | 0 | konflik kunci/nilai, boolean, versi; prosa bebas TIDAK jadi kontradiksi |
+| `test/unit/cache.test.mjs` | 21 | 21 | 0 | hit, miss, kedaluwarsa, invalidasi korpus, ukuran terbatas, baris rusak |
+| `test/unit/gc.test.mjs` | 13 | 13 | 0 | bukti yang dirujuk selamat, cap per sesi, batas hapus, dry run |
+| `test/unit/diff.test.mjs` | 12 | 12 | 0 | tambah, hapus, ubah, keluaran terbatas, cuplikan entri |
+| `test/unit/quality.test.mjs` | 13 | 13 | 0 | skor bergerak ke arah terdokumentasi saat bukti basi, duplikat, atau bertentangan |
+| `test/unit/graph.test.mjs` | 19 | 19 | 0 | relasi langsung, multi-hop, siklik, batas kedalaman dan node |
+| `test/unit/retrieval.test.mjs` | 8 | 8 | 0 | pipeline ujung-ke-ujung: cache, korpus berubah, jendela rusak, kontradiksi |
 | `test/unit/session.test.mjs` | 21 | 21 | 0 | klasifikasi kejadian, bentuk payload host sungguhan, anggaran snapshot, pemangkasan |
 | `test/unit/routing.test.mjs` | 15 | 15 | 0 | keputusan allow/advisory/deny dan throttle |
 | `test/unit/truncate.test.mjs` | 8 | 8 | 0 | anggaran byte, potong kepala+ekor, karakter multi-byte tidak pernah terbelah |
-| **Subtotal unit** | **129** | **129** | **0** | |
-| `test/host/registry.test.mjs` | 39 | 39 | 0 | pipeline host penuh, layanan sungguhan, tanpa mock |
+| **Subtotal unit** | **317** | **317** | **0** | |
+| `test/host/registry.test.mjs` | 47 | 47 | 0 | pipeline host penuh untuk 14 tool, layanan sungguhan, tanpa mock |
 | `test/host/confinement.test.mjs` | 7 | 7 | 0 | bubblewrap sungguhan: tulis di dalam boleh, tulis di luar ditolak |
 | `test/host/gate.test.mjs` | 1 | 0 | 1 | gagal tertutup saat `CTX_REQUIRE_HOST=1` dan checkout tidak ada |
-| **Subtotal host** | **47** | **46** | **1** | |
-| **Total `npm test`** | **176** | **175** | **1** | keluar dengan kode 0 |
+| **Subtotal host** | **55** | **54** | **1** | |
+| **Total `npm test`** | **372** | **371** | **1** | keluar dengan kode 0 |
+
+Ringkasan yang sama, dari keluaran `npm test` pada sesi ini:
+
+```text
+ℹ tests 372
+ℹ pass 371
+ℹ fail 0
+ℹ skipped 1
+```
 
 ## 10.3 Cara tahu test-nya berhasil
 
@@ -1316,7 +1567,7 @@ yang kebetulan dibaca handler.
 | `ctx_fetch_and_index` bilang `url host ... resolves to ..., a private or loopback address` | Berfungsi sebagaimana mestinya. Tambahkan host ke `fetch.allowHosts` hanya kalau Anda benar-benar ingin mengindeks layanan internal. |
 | `ctx_execute` untuk bahasa yang tidak terpasang mengembalikan `bwrap: execvp go: No such file or directory` | Program runtime-nya memang tidak ada di `PATH`. Plugin meneruskan pesan OS apa adanya di sini; `ctx_doctor` adalah cara resmi untuk mengecek status runtime. Lihat [Known issues](#known-issues-dari-audit-e2e-dan-source-review) butir 2. |
 | `ctx_search` tidak menemukan kata yang Anda yakin ada | Pencarian memakai tokenisasi FTS5. Query dipecah pada karakter non-alfanumerik, jadi `zzz-token-yang-tidak-pernah-ada` berubah jadi term `zzz`, `token`, `yang`, `tidak`, `pernah`, `ada` dan bisa mencocokkan baris yang cuma memuat `token`. Coco-kan query dengan potongan output yang benar-benar ada, seperti pada [7.4](#74-banyak-perintah-sekaligus-ctx_batch_execute). |
-| Dua implementasi dengan nama `ctx_*` yang sama muncul | Profil Anda mungkin sudahoyan menyediakan sepuluh nama ini lewat MCP server. Host memberi awalan nama server pada tool MCP, jadi tidak ada tabrakan registrasi, tapi ada tumpang tindih fungsional. Pilih salah satu, atau ubah `toolPrefix`. |
+| Dua implementasi dengan nama `ctx_*` yang sama muncul | Profil Anda mungkin sudahoyan menyediakan empat belas nama ini lewat MCP server. Host memberi awalan nama server pada tool MCP, jadi tidak ada tabrakan registrasi, tapi ada tumpang tindih fungsional. Pilih salah satu, atau ubah `toolPrefix`. |
 | `A patch row replaces the whole config value` menggigit Anda | Tulis ulang setiap kunci yang ingin dipertahankan di blok `config:`. Tidak ada merge dalam. |
 | `ctx_stats` melaporkan ukuran yang jauh lebih besar dari berkas yang terlihat di disk | `bytes` sengaja menyertakan WAL dan `-shm`. Berkas utama 32 KB dengan WAL 585 KB adalah kondisi normal saat checkpoint SQLite belum berjalan. |
 

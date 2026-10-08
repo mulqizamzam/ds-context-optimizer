@@ -40,3 +40,23 @@
       #     maxEventsPerSession: 5000
       #     maxSnapshotChars: 2048
       #     injectSnapshot: true
+      #   contextBudget:
+      #     enabled: true
+      #     totalChars: 12000
+      #     reserveChars: 2000
+      #     weights:
+      #       recent: 0.2
+      #       task: 0.3
+      #       evidence: 0.35
+      #       metadata: 0.15
+      #   cache:
+      #     enabled: true
+      #     ttlMs: 300000
+      #     maxEntries: 1000
+      #   retention:
+      #     ephemeralMs: 86400000
+      #     sessionMs: 604800000
+      #     projectMs: 2592000000
+      #   relations:
+      #     maxDepth: 2
+      #     maxNodes: 50

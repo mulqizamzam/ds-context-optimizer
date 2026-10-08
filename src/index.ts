@@ -13,10 +13,17 @@ import { evaluate, type RoutingConfig } from './routing/engine.js'
 import { AdvisoryThrottle } from './routing/throttle.js'
 import { LANGUAGES, isLanguage, probeRuntime } from './runtime.js'
 import { resolveProjectPath } from './security.js'
-import { ContentStore, type SearchOptions } from './store.js'
+import { ContentStore, type LineAnchor, type SearchOptions } from './store.js'
 import { SessionDB } from './session/db.js'
-import { buildSnapshot, classifyEvent, eventContent } from './session/snapshot.js'
+import { buildSnapshot, classifyEvent, eventContent, type SnapshotExtras } from './session/snapshot.js'
 import { resolveConfig, type ContextOptimizerConfig } from './config.js'
+import { RetrievalCache } from './cache.js'
+import { planGc } from './gc.js'
+import { detectContradictions, type Contradiction } from './contradiction.js'
+import { RelationshipGraph } from './graph.js'
+import { retrieve, type RetrievalDeps, type RetrievalRequest } from './retrieval.js'
+import { budgetReport, measureContext } from './budget.js'
+import { defineInfrastructureTools } from './tools/infrastructure.js'
 import {
   JSON_OBJECT_OUTPUT,
   JSON_OBJECT_RENDER,
@@ -79,12 +86,6 @@ interface BatchEntry {
   /** True when the executor had already cut the output before it was indexed. */
   readonly truncated: boolean
 }
-
-const COMMON_SEARCH_PARAMS = {
-  limit: { type: 'integer', description: 'Maximum hits per query.' },
-  source: { type: 'string', description: 'Restrict hits to one indexed source.' },
-  sort: { type: 'string', enum: ['relevance', 'timeline'], description: 'Ranking order.' },
-} as const
 
 /**
  * Ceiling on the bytes `ctx_index` will read in one call. Without it, a tree of
@@ -169,6 +170,23 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
 
   let sandboxProvider = resolveSandbox(hostContext, warn)
   let executor = new SandboxExecutor(sandboxProvider, executorOptions)
+  /**
+   * The retrieval cache and the relationship graph share the index store's
+   * connection rather than opening a database file each.
+   *
+   * A third and fourth file would mean a third and fourth write lock over the
+   * same state directory for no gain: the store already holds the WAL, the
+   * pragmas, and the transaction helper. Neither module is handed a path, only
+   * the handle, so neither can be pointed somewhere else by configuration.
+   */
+  const cache = new RetrievalCache(store.database, config.cache)
+  const graph = new RelationshipGraph(store.database)
+  const retrieval: RetrievalDeps = {
+    store,
+    cache,
+    budget: config.contextBudget,
+    search: config.search,
+  }
   /**
    * Feature-detect the sandbox service at call time instead of trusting the
    * snapshot taken during `apply`.
@@ -378,7 +396,11 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
             // the first while both entries still report chunks. The position in
             // this call is part of the key, so every entry owns its source.
             const source = `batch:${index}:${label}`
-            const { chunks } = store.indexSource(source, stdout)
+            const { chunks } = store.indexSource(source, stdout, {
+              sourceType: 'command',
+              command,
+              ...(entry.sessionId === undefined ? {} : { sessionId: entry.sessionId }),
+            })
             entries[index] = {
               label,
               source,
@@ -394,10 +416,30 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
         // the commands ran concurrently.
         const indexed = entries.filter((entryResult): entryResult is BatchEntry => entryResult !== undefined)
 
-        const hits = queries.map((query) => ({
-          query,
-          matches: store.search(query, { limit: config.search.defaultLimit, sort: 'relevance' }),
-        }))
+        // Through the same pipeline `ctx_search` uses, so a batch's answers and
+        // a search's answers cannot disagree about ranking. It also means a
+        // repeated batch query is a cache hit rather than a second BM25 pass
+        // over a corpus that has not changed.
+        const hits = queries.map((query) => {
+          const result = retrieve(retrieval, {
+            query,
+            limit: config.search.defaultLimit,
+            sort: 'relevance',
+            snippetChars: config.search.snippetChars,
+            // The batch just wrote these sources, so its own generation of the
+            // corpus is current by construction; caching it buys nothing and
+            // would put command output in a table its retention policy has to
+            // reason about.
+            noCache: true,
+          })
+          return {
+            query,
+            matches: result.matches,
+            quality: result.quality,
+            contradictions: result.contradictions,
+            hints: result.hints,
+          }
+        })
 
         return {
           ok: indexed.every((entryResult) => entryResult.exitCode === 0),
@@ -418,6 +460,8 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
         properties: {
           path: { type: 'string', description: 'Project-relative file or directory to index.' },
           source: { type: 'string', description: 'Source label stored with the chunks.' },
+          sourceType: { type: 'string', description: 'What kind of thing was indexed: file, directory, url, command, or session.' },
+          retention: { type: 'string', enum: ['ephemeral', 'session', 'project', 'persistent'], description: 'Lifecycle class the garbage collector treats this source under.' },
           maxFiles: { type: 'integer', description: 'Upper bound on files walked.' },
           maxDepth: { type: 'integer', description: 'Upper bound on directory depth.' },
           exclude: { type: 'array', description: 'Whole path segments to skip, matched segment by segment rather than as substrings.', items: { type: 'string' } },
@@ -439,6 +483,10 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
         const source = typeof args.source === 'string' && args.source !== ''
           ? args.source
           : `project:${path.basename(cwd)}`
+        const sourceType = typeof args.sourceType === 'string' && args.sourceType !== ''
+          ? args.sourceType
+          : (statOrNull(base)?.isFile() === true ? 'file' : 'directory')
+        const retention = retentionArg(args.retention)
         const maxFiles = toInt(args.maxFiles, 200)
         const maxDepth = toInt(args.maxDepth, 5)
         const exclude = Array.isArray(args.exclude)
@@ -455,9 +503,25 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
           return failure(`path not found: ${relative}`, emptyIndexReport(relative, source))
         }
 
-        const walkResult = walk(base, maxDepth, maxFiles, exclude)
+        // A path that names a FILE is indexed as that file. `walk` only reads
+        // directories, so handing it a file returned no candidates at all and
+        // the call came back as "found nothing readable" — while the README has
+        // always promised `ctx_index` accepts "berkas atau direktori". The
+        // single file is the walk result of one entry.
+        const baseStat = statOrNull(base)
+        const walkResult =
+          baseStat !== null && baseStat.isFile()
+            ? { files: [base], excluded: 0 }
+            : walk(base, maxDepth, maxFiles, exclude)
         const files = walkResult.files
         const combined: string[] = []
+        // Offset of the next byte to be appended, tracked while walking so each
+        // chunk can be tied back to a real line in a real file. The separator
+        // is part of each piece rather than applied by `join`, because a `join`
+        // would shift every offset after the first and turn the line numbers
+        // into something approximate.
+        const anchors: LineAnchor[] = []
+        let offset = 0
         let bytes = 0
         let read = 0
         let skipped = 0
@@ -476,7 +540,13 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
               continue
             }
             const body = readText(file)
-            combined.push(`FILE ${file}\n${body}`)
+            const header = `FILE ${file}\n`
+            const from = offset + header.length
+            const to = from + body.length
+            anchors.push({ path: file, from, to })
+            const piece = `${header}${body}\n`
+            combined.push(piece)
+            offset += piece.length
             bytes += body.length
             read += 1
           } catch {
@@ -507,10 +577,26 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
             },
           )
         }
-        const { chunks, applied } = store.indexSource(source, combined.join('\n'))
+        const { chunks, applied, sourceId, contentHash, firstSeenAt, retention: storedRetention } =
+          store.indexSource(
+          source,
+          combined.join(''),
+          {
+            sourceType,
+            pathOrUrl: base,
+            // Recorded so a later snapshot can name what THIS session produced
+            // without the snapshot builder having to reconstruct it from the
+            // event log, where the same fact is only a command string.
+            ...(sessionIdOf(execution) === undefined ? {} : { sessionId: sessionIdOf(execution) }),
+            ...(retention === undefined ? {} : { retention }),
+            anchors,
+          },
+        )
         return {
           ok: failures === 0,
           source,
+          sourceId,
+          sourceType,
           files: files.length,
           indexed: read,
           excluded: walkResult.excluded,
@@ -523,17 +609,30 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
           // need not infer it from `chunks`, which is identical before and after
           // a refusal that deliberately kept the old corpus.
           applied,
+          contentHash,
+          firstSeenAt,
+          // Reported whether the caller named a class or the store derived one
+          // from the source type: a caller that has to guess which lifecycle
+          // class its corpus landed in cannot reason about `ctx_gc` at all.
+          retention: storedRetention ?? 'project',
         }
       }) as never,
     }),
     defineTool({
       name: `${prefix}search`,
-      description: 'Rank the indexed corpus against one or more queries and return scored excerpts rather than raw matches.',
+      description: 'Rank the indexed corpus against one or more queries and return scored excerpts with provenance, a quality assessment, and any contradictions the evidence carries.',
       parameters: {
         type: 'object',
         properties: {
           queries: { type: 'array', description: 'Queries to run.', items: { type: 'string' } },
-          ...COMMON_SEARCH_PARAMS,
+          limit: { type: 'integer', description: 'Maximum hits per query.' },
+          source: { type: 'string', description: 'Restrict hits to one indexed source.' },
+          sort: { type: 'string', enum: ['relevance', 'timeline'], description: 'Ranking order.' },
+          temporal: { type: 'string', enum: ['any', 'latest', 'historical'], description: 'Temporal selection: latest puts the newest evidence first, historical the oldest.' },
+          before: { type: 'string', description: 'ISO-8601 timestamp or epoch ms; only evidence written at or before it.' },
+          after: { type: 'string', description: 'ISO-8601 timestamp or epoch ms; only evidence written at or after it.' },
+          sessionId: { type: 'string', description: 'Restrict hits to evidence indexed for one session.' },
+          noCache: { type: 'boolean', description: 'Bypass the retrieval cache for this call.' },
         },
         required: ['queries'],
         additionalProperties: false,
@@ -542,13 +641,32 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
       execute: (async (rawArgs: unknown) => {
         const args = asRecord(rawArgs)
         const queries = Array.isArray(args.queries) ? args.queries.map((q) => String(q)) : []
-        const options: SearchOptions = {
+        const base: Omit<RetrievalRequest, 'query'> = {
           limit: Math.max(1, Math.min(toInt(args.limit, config.search.defaultLimit), config.search.maxLimit)),
           ...(typeof args.source === 'string' && args.source !== '' ? { source: args.source } : {}),
           ...(args.sort === 'timeline' ? { sort: 'timeline' as const } : {}),
           snippetChars: config.search.snippetChars,
+          ...(args.temporal === 'latest' || args.temporal === 'historical' ? { temporal: args.temporal } : {}),
+          ...(args.before === undefined ? {} : { before: args.before }),
+          ...(args.after === undefined ? {} : { after: args.after }),
+          ...(typeof args.sessionId === 'string' && args.sessionId !== '' ? { sessionId: args.sessionId } : {}),
+          ...(args.noCache === true ? { noCache: true } : {}),
         }
-        return { ok: true, results: queries.map((query) => ({ query, matches: store.search(query, options) })) }
+        return {
+          ok: true,
+          results: queries.map((query) => {
+            const result = retrieve(retrieval, { ...base, query })
+            return {
+              query,
+              matches: result.matches,
+              quality: result.quality,
+              contradictions: result.contradictions,
+              temporal: result.temporal,
+              cache: result.cache,
+              hints: result.hints,
+            }
+          }),
+        }
       }) as never,
     }),
     defineTool({
@@ -590,7 +708,10 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
         const body = outcome.body
         const textBody = body.text
         const source = typeof args.source === 'string' && args.source !== '' ? args.source : `url:${url}`
-        const { chunks } = store.indexSource(source, htmlToText(textBody))
+        const { chunks, sourceId } = store.indexSource(source, htmlToText(textBody), {
+          sourceType: 'url',
+          pathOrUrl: outcome.finalUrl,
+        })
         const query = typeof args.query === 'string' ? args.query : ''
         return {
           ok: true,
@@ -600,7 +721,28 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
           bytes: body.bytes,
           truncated: body.truncated,
           summary: summarize(htmlToText(textBody), 1_000),
-          ...(query === '' ? {} : { results: store.search(query, { limit: config.search.defaultLimit }) }),
+          ...(query === ''
+            ? {}
+            : {
+                results: [
+                  (() => {
+                    const result = retrieve(retrieval, {
+                      query,
+                      limit: config.search.defaultLimit,
+                      sort: 'relevance',
+                      snippetChars: config.search.snippetChars,
+                      source,
+                      noCache: true,
+                    })
+                    return {
+                      query,
+                      matches: result.matches,
+                      quality: result.quality,
+                      contradictions: result.contradictions,
+                    }
+                  })(),
+                ],
+              }),
         }
       }) as never,
     }),
@@ -620,28 +762,42 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
           ? args.sessionId
           : sessionIdOf(execution)
         if (target === undefined) return failure('no session id on the calling agent and none supplied')
-        const snapshot = buildSnapshot(db.events(target), config.session.maxSnapshotChars)
+        const snapshot = buildSnapshot(
+          db.events(target),
+          config.session.maxSnapshotChars,
+          snapshotExtras(store, target),
+        )
         db.saveSnapshot(target, snapshot)
         return { ok: true, sessionId: target, snapshot }
       }) as never,
     }),
     defineTool({
       name: `${prefix}stats`,
-      description: 'Report what the index and session store currently hold: sources, chunks, events, and database size.',
+      description: 'Report what the index and session store currently hold: sources, chunks, events, cache, relationships, budget utilisation, and reclaimable records.',
       parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
       output: { schema: JSON_OBJECT_OUTPUT, render: JSON_OBJECT_RENDER },
-      execute: (async () => ({
-        ok: true,
-        index: store.stats(),
-        sessions: { events: db.eventCount(), sessions: db.sessionCount() },
-        stateDir,
-        indexFile,
-        sessionsFile,
-      })) as never,
+      execute: (async () => {
+        const indexStats = store.stats()
+        return {
+          ok: true,
+          index: indexStats,
+          sessions: { events: db.eventCount(), sessions: db.sessionCount() },
+          // Budget utilisation is a configuration fact plus one measurement, so
+          // it belongs next to the numbers it constrains rather than in a
+          // separate diagnostic a reader has to know to ask for.
+          contextBudget: budgetReport(config.contextBudget),
+          cache: cache.stats(),
+          relations: graph.stats(),
+          gc: gcSummary(store, db, config),
+          stateDir,
+          indexFile,
+          sessionsFile,
+        }
+      }) as never,
     }),
     defineTool({
       name: `${prefix}doctor`,
-      description: 'Self-check: sandbox availability, whether each language runtime is installed, missing, or could not be probed on PATH, state store health, and every failure this plugin recorded.',
+      description: 'Self-check: sandbox availability, whether each language runtime is installed, missing, or could not be probed on PATH, state store health, schema versions, cache and graph state, and every failure this plugin recorded.',
       parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
       output: { schema: JSON_OBJECT_OUTPUT, render: JSON_OBJECT_RENDER },
       execute: (async () => {
@@ -673,6 +829,13 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
           runtimes,
           index: store.stats(),
           sessions: { events: db.eventCount(), sessions: db.sessionCount() },
+          // Schema state is reported, not assumed: a store that failed to
+          // migrate is a store whose provenance answers are meaningless, and the
+          // version pair is the only place that is visible.
+          schema: schemaReport(store, db),
+          cache: cache.stats(),
+          relations: graph.stats(),
+          contextBudget: budgetReport(config.contextBudget),
           routing: { ...routing, advisoryThrottle: config.routing.advisoryThrottle },
           errors: errors.slice(),
         }
@@ -713,6 +876,7 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
         return { ok: true, deleted: true, scope, ...deleted }
       }) as never,
     }),
+    ...defineInfrastructureTools({ store, db, graph, config }),
   ]
 
   for (const definition of definitions) {
@@ -814,7 +978,8 @@ export function apply(rawContext: unknown, rawConfig: unknown = {}): RuntimeView
         systemPrompt.context({
           name: `${name}-resume`,
           order: 60,
-          text: (assemble) => renderResume(db, config.session.maxSnapshotChars, assemble, warn),
+          text: (assemble) =>
+            renderResume({ db, store, maxChars: config.session.maxSnapshotChars }, assemble, warn),
         })
       }
     } catch (error) {
@@ -896,8 +1061,7 @@ function resolveSandbox(
  * model can tell stored history apart from something the operator just typed.
  */
 function renderResume(
-  db: SessionDB,
-  maxChars: number,
+  deps: { db: SessionDB; store: ContentStore; maxChars: number },
   assemble: AssembleContext,
   warn: (message: string) => void,
 ): string {
@@ -905,7 +1069,10 @@ function renderResume(
   const sessionId = agent?.session?.header?.id ?? agent?.id
   if (sessionId === undefined) return ''
   try {
-    const snapshot = db.snapshot(sessionId) ?? buildSnapshot(db.events(sessionId), maxChars)
+    const db = deps.db
+    const snapshot =
+      db.snapshot(sessionId) ??
+      buildSnapshot(db.events(sessionId), deps.maxChars, snapshotExtras(deps.store, sessionId))
     if (EMPTY_SNAPSHOT.test(snapshot)) return ''
     db.saveSnapshot(sessionId, snapshot)
     return `[context-optimizer] Earlier context from this session, recovered from the local event log:\n${snapshot}`
@@ -913,6 +1080,135 @@ function renderResume(
     warn(`resume snapshot failed: ${messageOf(error)}`)
     return ''
   }
+}
+
+/**
+ * Evidence and contradiction sections for one session's snapshot.
+ *
+ * Both come from the session's own writes, which is what keeps the snapshot
+ * honest: a resumed session is told what IT produced and where that evidence
+ * disagreed, not what the whole corpus happens to contain. Every value is
+ * produced by the bounded helpers in `contradiction.ts` and clipped again here,
+ * because the snapshot's hard ceiling is the promise this plugin makes and a
+ * section that ignores it breaks the whole document.
+ */
+function snapshotExtras(store: ContentStore, sessionId: string): SnapshotExtras {
+  // Eight chunks, and only the first 300 characters of each for the claims.
+  // Prompt assembly runs on every turn, so this bound is the difference between
+  // a snapshot that costs one indexed lookup and one that walks a 32 MB chunk
+  // pair on each of them. A contradiction that needs more than the head of a
+  // chunk to be visible is not one this path should be deciding anyway.
+  const evidence = store.evidenceOfSession(sessionId, 8)
+  if (evidence.length === 0) return {}
+  const claims = evidence.map((record) => ({
+    evidenceId: record.evidenceId,
+    source: record.source,
+    snippet: record.text.slice(0, 300),
+  }))
+  const contradictions = detectContradictions(claims, 5).map(
+    (contradiction: Contradiction) =>
+      `${contradiction.confidence}: ${contradiction.subject} `
+      + `(${contradiction.evidenceA.evidenceId} vs ${contradiction.evidenceB.evidenceId}) `
+      + `${contradiction.reason}`.slice(0, 400),
+  )
+  const important = evidence
+    .slice(0, 3)
+    .map(
+      (record) =>
+        `${record.evidenceId} ${record.source} `
+        + `${record.sourceType} ${record.charLen} characters`
+        + (record.lineStart === undefined ? '' : ` lines ${record.lineStart}-${record.lineEnd ?? record.lineStart}`)
+        + (record.command === undefined ? '' : ` command ${record.command.slice(0, 120)}`),
+    )
+  return {
+    importantEvidence: important,
+    contradictions,
+  }
+}
+
+/**
+ * Reclaimable totals for `ctx_stats`.
+ *
+ * A bounded sample, and labelled as one: the full answer is `ctx_gc` in dry-run
+ * mode, which reads every row. Counting to the cap and reporting the total
+ * anyway would be a number that looks complete and is not.
+ */
+function gcSummary(store: ContentStore, db: SessionDB, config: ContextOptimizerConfig): Record<string, unknown> {
+  const limit = 5_000
+  const storeRecords = store.gcRecords(limit)
+  const eventRecords = db.gcRecords(limit)
+  const plan = planGc(
+    {
+      records: [
+        ...storeRecords.map((record) => ({
+          kind: 'source' as const,
+          id: record.id,
+          class: record.retention,
+          bytes: record.bytes,
+          updatedAt: record.updatedAt,
+          referenced: record.referenced,
+        })),
+        ...eventRecords.map((record) => ({
+          kind: 'session_event' as const,
+          id: record.id,
+          class: record.retention,
+          bytes: record.bytes,
+          updatedAt: record.updatedAt,
+          sessionId: record.sessionId,
+          referenced: record.referenced,
+        })),
+      ],
+      maxDeletes: 10_000,
+    },
+    Date.now(),
+    {
+      ephemeralMs: config.retention.ephemeralMs,
+      sessionMs: config.retention.sessionMs,
+      projectMs: config.retention.projectMs,
+      maxEventsPerSession: config.session.maxEventsPerSession,
+    },
+    true,
+  )
+  return {
+    reclaimableRecords: plan.reclaimable.records,
+    reclaimableBytes: plan.reclaimable.bytes,
+    protectedRecords: plan.protected.records,
+    sampled: storeRecords.length >= limit || eventRecords.length >= limit,
+  }
+}
+
+/** Schema versions of both stores, so a stale store is visible without opening it. */
+function schemaReport(store: ContentStore, db: SessionDB): Record<string, unknown> {
+  return {
+    index: {
+      version: store.report.toVersion,
+      applied: store.report.applied.slice(),
+      adoptedLegacy: store.report.adoptedLegacy,
+    },
+    sessions: {
+      version: db.report.toVersion,
+      applied: db.report.applied.slice(),
+      adoptedLegacy: db.report.adoptedLegacy,
+    },
+  }
+}
+
+/** A retention argument that is one of the four classes, or nothing. */
+function retentionArg(value: unknown): 'ephemeral' | 'session' | 'project' | 'persistent' | undefined {
+  switch (value) {
+    case 'ephemeral':
+    case 'session':
+    case 'project':
+    case 'persistent':
+      return value
+    default:
+      return undefined
+  }
+}
+
+/** Size of one generated payload, in characters of its canonical serial form. */
+function payloadSize(value: unknown): number {
+  return measureContext(value)
 }
 
 const EMPTY_SNAPSHOT = /^<session_snapshot>\s*<\/session_snapshot>$/
@@ -929,7 +1225,7 @@ function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error
 }
 
-function statOrNull(file: string): { size: number } | null {
+function statOrNull(file: string): fs.Stats | null {
   try {
     return fs.statSync(file)
   } catch {
